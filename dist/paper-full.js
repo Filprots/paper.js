@@ -9,7 +9,7 @@
  *
  * All rights reserved.
  *
- * Date: Wed Jul 17 14:57:24 2024 +0200
+ * Date: Sun Sep 27 23:13:45 2026 +0200
  *
  ***
  *
@@ -12865,7 +12865,10 @@ var View = Base.extend(Emitter, {
 				var that = this;
 				DomEvent.add(window, this._windowEvents = {
 					resize: function() {
-						that.setViewSize(getCanvasSize());
+						var size = DomElement.getSize(element);
+						that._resizeWhenShown = size.isNaN() || size.isZero();
+						if (!that._resizeWhenShown)
+							that.setViewSize(size);
 					}
 				});
 			}
@@ -13265,7 +13268,7 @@ new function() {
 		mousedown = 'touchstart';
 		mousemove = 'touchmove';
 		mouseup = 'touchend touchcancel';
-		if (!('ontouchstart' in window && navigator.userAgent.match(
+		if (true || !('ontouchstart' in window && navigator.userAgent.match(
 				/mobile|tablet|ip(ad|hone|od)|android|silk/i))) {
 			mousedown += ' mousedown';
 			mousemove += ' mousemove';
@@ -13584,6 +13587,7 @@ var CanvasView = View.extend({
 						'backingStorePixelRatio') || 1;
 			this._pixelRatio = deviceRatio / backingStoreRatio;
 		}
+		this._nativePixelRatio = this._pixelRatio;
 		View.call(this, project, canvas);
 		this._needsUpdate = true;
 	},
@@ -13594,9 +13598,15 @@ var CanvasView = View.extend({
 	},
 
 	_setElementSize: function _setElementSize(width, height) {
-		var pixelRatio = this._pixelRatio;
+		var previous = this._pixelRatio,
+			pixelRatio = this._nativePixelRatio || previous;
+		if (width > 0 && height > 0)
+			pixelRatio = Math.min(pixelRatio,
+					CanvasView.MAX_SIDE / width, CanvasView.MAX_SIDE / height,
+					Math.sqrt(CanvasView.MAX_AREA / (width * height)));
+		this._pixelRatio = pixelRatio;
 		_setElementSize.base.call(this, width * pixelRatio, height * pixelRatio);
-		if (pixelRatio !== 1) {
+		if (pixelRatio !== 1 || previous !== 1) {
 			var element = this._element,
 				ctx = this._context;
 			if (!PaperScope.hasAttribute(element, 'resize')) {
@@ -13604,9 +13614,17 @@ var CanvasView = View.extend({
 				style.width = width + 'px';
 				style.height = height + 'px';
 			}
-			ctx.restore();
-			ctx.save();
-			ctx.scale(pixelRatio, pixelRatio);
+			try {
+				ctx.restore();
+				ctx.save();
+				if (pixelRatio !== 1)
+					ctx.scale(pixelRatio, pixelRatio);
+			} catch (e) {
+				this._pixelRatio = 1;
+				_setElementSize.base.call(this, width, height);
+				ctx.restore();
+				ctx.save();
+			}
 		}
 	},
 
@@ -13641,6 +13659,13 @@ var CanvasView = View.extend({
 	},
 
 	update: function() {
+		if (this._resizeWhenShown) {
+			var size = DomElement.getSize(this._element);
+			if (!size.isNaN() && !size.isZero()) {
+				this._resizeWhenShown = false;
+				this.setViewSize(size);
+			}
+		}
 		if (!this._needsUpdate)
 			return false;
 		var project = this._project,
@@ -13653,6 +13678,9 @@ var CanvasView = View.extend({
 		return true;
 	}
 });
+
+CanvasView.MAX_SIDE = 16384;
+CanvasView.MAX_AREA = 64 * 1024 * 1024;
 
 var Event = Base.extend({
 	_class: 'Event',
