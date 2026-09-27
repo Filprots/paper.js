@@ -1080,7 +1080,9 @@ new function() { // Injection scope for event handling on the browser
         mousemove = 'touchmove';
         mouseup = 'touchend touchcancel';
         // Do not add mouse events on mobile and tablet devices
-        if (!('ontouchstart' in window && navigator.userAgent.match(
+        // IRRIS: add them there too - the planner listens to both (carried
+        // over from the build irrippr shipped as ppr/_ppr.js until 0.12.17)
+        if (true || !('ontouchstart' in window && navigator.userAgent.match(
                 /mobile|tablet|ip(ad|hone|od)|android|silk/i))) {
             // For non pointer events browsers and mixed browsers, like chrome
             // on Windows8 touch laptop.
