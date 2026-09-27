@@ -64,7 +64,19 @@ var View = Base.extend(Emitter, /** @lends View# */{
                 var that = this;
                 DomEvent.add(window, this._windowEvents = {
                     resize: function() {
-                        that.setViewSize(getCanvasSize());
+                        // IRRIS: a hidden element (display: none) has no
+                        // rendered size, so getCanvasSize() fell back to its
+                        // width / height attributes - which _setElementSize()
+                        // had already multiplied by the pixel ratio. Every
+                        // window resize grew a hidden canvas by that ratio
+                        // again, until the browser could not allocate it:
+                        // "Canvas is already in error state". A hidden view
+                        // keeps its size, and CanvasView#update() resizes it
+                        // once it can be measured again.
+                        var size = DomElement.getSize(element);
+                        that._resizeWhenShown = size.isNaN() || size.isZero();
+                        if (!that._resizeWhenShown)
+                            that.setViewSize(size);
                     }
                 });
             }

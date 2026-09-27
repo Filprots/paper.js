@@ -55,6 +55,9 @@ var CanvasView = View.extend(/** @lends CanvasView# */{
                         'backingStorePixelRatio') || 1;
             this._pixelRatio = deviceRatio / backingStoreRatio;
         }
+        // IRRIS: the ratio asked for; _pixelRatio is the one the backing
+        // store can afford at the current size, see _setElementSize()
+        this._nativePixelRatio = this._pixelRatio;
         View.call(this, project, canvas);
         // We can't be sure the canvas is clear
         this._needsUpdate = true;
@@ -66,10 +69,23 @@ var CanvasView = View.extend(/** @lends CanvasView# */{
     },
 
     _setElementSize: function _setElementSize(width, height) {
-        var pixelRatio = this._pixelRatio;
+        // IRRIS: a backing store past the browser's limits cannot be allocated
+        // and its context falls into an error state, so the pixel ratio is
+        // lowered for a view that would need more than MAX_SIDE per side or
+        // MAX_AREA pixels. And a context that falls into the error state anyway
+        // is re-armed: a valid size clears it, so the same canvas comes back at
+        // pixel ratio 1 instead of throwing on every draw.
+        var previous = this._pixelRatio,
+            pixelRatio = this._nativePixelRatio || previous;
+        if (width > 0 && height > 0)
+            pixelRatio = Math.min(pixelRatio,
+                    CanvasView.MAX_SIDE / width, CanvasView.MAX_SIDE / height,
+                    Math.sqrt(CanvasView.MAX_AREA / (width * height)));
+        // update() and Item#draw() read it:
+        this._pixelRatio = pixelRatio;
         // Upscale the canvas if the pixel ratio is more than 1.
         _setElementSize.base.call(this, width * pixelRatio, height * pixelRatio);
-        if (pixelRatio !== 1) {
+        if (pixelRatio !== 1 || previous !== 1) {
             var element = this._element,
                 ctx = this._context;
             // We need to set the correct size on non-resizable canvases through
@@ -82,9 +98,17 @@ var CanvasView = View.extend(/** @lends CanvasView# */{
             }
             // Scale the context to counter the fact that we've manually scaled
             // our canvas element.
-            ctx.restore();
-            ctx.save();
-            ctx.scale(pixelRatio, pixelRatio);
+            try {
+                ctx.restore();
+                ctx.save();
+                if (pixelRatio !== 1)
+                    ctx.scale(pixelRatio, pixelRatio);
+            } catch (e) {
+                this._pixelRatio = 1;
+                _setElementSize.base.call(this, width, height);
+                ctx.restore();
+                ctx.save();
+            }
         }
     },
 
@@ -134,6 +158,15 @@ var CanvasView = View.extend(/** @lends CanvasView# */{
      * @return {Boolean} {@true if the view was updated}
      */
     update: function() {
+        // IRRIS: a window resize skipped while the canvas was hidden (see the
+        // View constructor) is applied once the canvas can be measured again.
+        if (this._resizeWhenShown) {
+            var size = DomElement.getSize(this._element);
+            if (!size.isNaN() && !size.isZero()) {
+                this._resizeWhenShown = false;
+                this.setViewSize(size);
+            }
+        }
         if (!this._needsUpdate)
             return false;
         var project = this._project,
@@ -146,3 +179,9 @@ var CanvasView = View.extend(/** @lends CanvasView# */{
         return true;
     }
 });
+
+// IRRIS: backing-store limits for CanvasView#_setElementSize(), below every
+// current browser's canvas maximum (Chrome / Firefox: 32767 px per side,
+// Firefox ~500 megapixels) and far above any viewport x pixel ratio.
+CanvasView.MAX_SIDE = 16384;
+CanvasView.MAX_AREA = 64 * 1024 * 1024;
