@@ -9,7 +9,7 @@
  *
  * All rights reserved.
  *
- * Date: Tue Oct 13 09:00:00 2026 +0200
+ * Date: Tue Oct 13 13:52:05 2026 +0200
  *
  ***
  *
@@ -2910,6 +2910,16 @@ var Project = PaperScopeItem.extend({
 				view._needsUpdate = true;
 				if (!view._requested && view._autoUpdate)
 					view.requestUpdate();
+				var cache = view._cache,
+					seed = view._seed;
+				if (!(flags & 4096)) {
+					if (cache && !cache.stale
+							&& this._isCachedChange(flags, item, cache.top))
+						cache.stale = true;
+					if (seed && !seed.dirty
+							&& this._isCachedChange(flags, item, seed.top))
+						seed.dirty = true;
+				}
 			}
 		}
 		var changes = this._changes;
@@ -2923,6 +2933,17 @@ var Project = PaperScopeItem.extend({
 				changes.push(changesById[id] = { item: item, flags: flags });
 			}
 		}
+	},
+
+	_isCachedChange: function(flags, item, top) {
+		if (!item)
+			return true;
+		if (item instanceof Layer)
+			return !(item._index >= top)
+					|| !!(flags & 4);
+		while (item._parent && !(item instanceof Layer))
+			item = item._parent;
+		return item instanceof Layer ? item._index < top : !!item._symbol;
 	},
 
 	clear: function() {
@@ -3099,8 +3120,14 @@ var Project = PaperScopeItem.extend({
 		}
 	},
 
-	draw: function(ctx, matrix, pixelRatio) {
+	draw: function(ctx, matrix, pixelRatio, _cull) {
 		this._updateVersion++;
+		this._drawLayers(ctx, matrix, pixelRatio, 0, this._children.length,
+				_cull);
+		this._drawSelection(ctx, matrix);
+	},
+
+	_drawLayers: function(ctx, matrix, pixelRatio, from, to, cull) {
 		ctx.save();
 		matrix.applyToContext(ctx);
 		var children = this._children,
@@ -3111,11 +3138,15 @@ var Project = PaperScopeItem.extend({
 				matrices: [new Matrix()],
 				updateMatrix: true
 			});
-		for (var i = 0, l = children.length; i < l; i++) {
+		if (cull && Item.cull)
+			param.cull = cull;
+		for (var i = from; i < to; i++) {
 			children[i].draw(ctx, param);
 		}
 		ctx.restore();
+	},
 
+	_drawSelection: function(ctx, matrix) {
 		if (this._selectionCount > 0) {
 			ctx.save();
 			ctx.strokeWidth = 1;
@@ -3140,7 +3171,28 @@ var Item = Base.extend(Emitter, {
 		},
 
 		INSERT: { insert: true },
-		NO_INSERT: { insert: false }
+		NO_INSERT: { insert: false },
+
+		cull: true,
+		CULL_PX: 40,
+		CULL_UNITS: 60,
+
+		_matrixVersion: 0,
+
+		_getCullArea: function(matrix, left, top, right, bottom) {
+			var inverse = matrix.inverted();
+			if (!inverse)
+				return null;
+			var rect = inverse._transformBounds(
+					new Rectangle(left, top, right - left, bottom - top));
+			return {
+				left: left, top: top, right: right, bottom: bottom,
+				x0: rect.x, y0: rect.y,
+				x1: rect.x + rect.width, y1: rect.y + rect.height,
+				zoom: Math.sqrt(Math.abs(matrix._a * matrix._d
+						- matrix._b * matrix._c))
+			};
+		}
 	},
 
 	_class: 'Item',
@@ -3270,6 +3322,16 @@ new function() {
 		}
 		if (flags & 16) {
 			this._globalMatrix = undefined;
+		}
+		if (flags & 18) {
+			Item._matrixVersion++;
+		}
+		if (flags & 1) {
+			var item = this;
+			if (item._cullReach)
+				item._cullReach = null;
+			while ((item = item._parent) && item._cullReach)
+				item._cullReach = null;
 		}
 		if (cacheParent
 				&& (flags & 72)) {
@@ -3699,6 +3761,9 @@ new function() {
 
 	getGlobalMatrix: function(_dontClone) {
 		var matrix = this._globalMatrix;
+		if (matrix && this._parent
+				&& this._globalMatrixVersion !== Item._matrixVersion)
+			matrix = null;
 		if (matrix) {
 			var parent = this._parent;
 			var parents = [];
@@ -3719,6 +3784,7 @@ new function() {
 			var parent = this._parent;
 			if (parent)
 				matrix.prepend(parent.getGlobalMatrix(true));
+			this._globalMatrixVersion = Item._matrixVersion;
 		}
 		return _dontClone ? matrix : matrix.clone();
 	},
@@ -4705,6 +4771,111 @@ new function() {
 		}
 	},
 
+	_getCullState: function(cull, matrix) {
+		var reach = this._cullReach || this._getCullReach(),
+			cached = this._bounds,
+			entry = cached && cached['000'],
+			rect = entry ? entry.rect
+				: this._getCachedBounds(null, { cacheItem: this }).rect,
+			units = reach[0],
+			x0 = rect.x - units,
+			y0 = rect.y - units,
+			x1 = rect.x + rect.width + units,
+			y1 = rect.y + rect.height + units;
+		if (!matrix.isIdentity()) {
+			var a = matrix._a, b = matrix._b, c = matrix._c, d = matrix._d,
+				ax0 = a * x0, ax1 = a * x1, cy0 = c * y0, cy1 = c * y1,
+				bx0 = b * x0, bx1 = b * x1, dy0 = d * y0, dy1 = d * y1;
+			x0 = Math.min(ax0, ax1) + Math.min(cy0, cy1) + matrix._tx;
+			x1 = Math.max(ax0, ax1) + Math.max(cy0, cy1) + matrix._tx;
+			y0 = Math.min(bx0, bx1) + Math.min(dy0, dy1) + matrix._ty;
+			y1 = Math.max(bx0, bx1) + Math.max(dy0, dy1) + matrix._ty;
+		}
+		var pad = Item.CULL_UNITS + (Item.CULL_PX + reach[1]) / cull.zoom;
+		return x0 - pad > cull.x1 || y0 - pad > cull.y1
+				|| x1 + pad < cull.x0 || y1 + pad < cull.y0 ? 1
+				: x0 >= cull.x0 && y0 >= cull.y0 && x1 <= cull.x1
+					&& y1 <= cull.y1 ? 2 : 0;
+	},
+
+	_getCullReach: function() {
+		var reach = this._cullReach;
+		if (reach)
+			return reach;
+		var units = 0,
+			px = 0,
+			cache = true,
+			children = this._children,
+			sub;
+		if (this instanceof SymbolItem) {
+			sub = this._definition._item._getCullReach();
+			units = sub[0];
+			px = sub[1];
+			cache = false;
+		} else if (children && !(this instanceof CompoundPath)) {
+			for (var i = 0, l = children.length; i < l; i++) {
+				sub = children[i]._getCullReach();
+				if (sub[0] > units)
+					units = sub[0];
+				if (sub[1] > px)
+					px = sub[1];
+				if (!sub[2])
+					cache = false;
+			}
+		} else {
+			var style = this._style;
+			if (style.hasStroke()) {
+				var stroke = style.getStrokeWidth() / 2 * Math.max(
+						style.getStrokeJoin() === 'miter'
+							? style.getMiterLimit() : 1,
+						style.getStrokeCap() === 'square' ? Math.SQRT2 : 1,
+						1);
+				if (this._canScaleStroke && !style.getStrokeScaling())
+					px = stroke;
+				else
+					units = stroke;
+			}
+			if (style.hasShadow()) {
+				var offset = style.getShadowOffset();
+				units += style.getShadowBlur() + Math.abs(offset.x)
+						+ Math.abs(offset.y);
+			}
+			if (this instanceof TextItem)
+				units += style.getFontSize() / 2;
+		}
+		var m = this._matrix;
+		if (units && !m.isIdentity())
+			units *= Math.max(Math.sqrt(m._a * m._a + m._b * m._b),
+					Math.sqrt(m._c * m._c + m._d * m._d));
+		reach = [units >= 0 ? units : Infinity, px >= 0 ? px : Infinity, cache];
+		if (cache)
+			this._cullReach = reach;
+		return reach;
+	},
+
+	_cacheSymbolMatrices: function(matrix) {
+		if (!this._visible || this._opacity === 0)
+			return;
+		var globalMatrix = matrix.appended(this._matrix);
+		if (!globalMatrix.isInvertible())
+			return;
+		this._globalMatrix = globalMatrix;
+		this._globalMatrixVersion = Item._matrixVersion;
+		if (this instanceof SymbolItem) {
+			this._definition._item._cacheSymbolMatrices(globalMatrix);
+		} else if (this._children) {
+			var children = this._children,
+				clipItem = this._getClipItem && this._getClipItem();
+			if (clipItem && !clipItem._getCullReach()[2])
+				clipItem._cacheSymbolMatrices(globalMatrix);
+			for (var i = 0, l = children.length; i < l; i++) {
+				var child = children[i];
+				if (child !== clipItem && !child._getCullReach()[2])
+					child._cacheSymbolMatrices(globalMatrix);
+			}
+		}
+	},
+
 	draw: function(ctx, param, parentStrokeMatrix) {
 		var updateVersion = this._updateVersion = this._project._updateVersion;
 		if (!this._visible || this._opacity === 0)
@@ -4712,7 +4883,19 @@ new function() {
 		var matrices = param.matrices,
 			viewMatrix = param.viewMatrix,
 			matrix = this._matrix,
-			globalMatrix = matrices[matrices.length - 1].appended(matrix);
+			cull = param.cull,
+			inside = false;
+		if (cull && !param.clip && !param.dontStart && !this._clipMask
+				&& this._parent && !(this instanceof Layer)) {
+			var state = this._getCullState(cull, matrices[matrices.length - 1]);
+			if (state === 1) {
+				if (!this._getCullReach()[2])
+					this._cacheSymbolMatrices(matrices[matrices.length - 1]);
+				return;
+			}
+			inside = state === 2 && !!this._children;
+		}
+		var globalMatrix = matrices[matrices.length - 1].appended(matrix);
 		if (!globalMatrix.isInvertible())
 			return;
 
@@ -4722,6 +4905,7 @@ new function() {
 		matrices.push(globalMatrix);
 		if (param.updateMatrix) {
 			this._globalMatrix = globalMatrix;
+			this._globalMatrixVersion = Item._matrixVersion;
 		}
 
 		var blendMode = this._blendMode,
@@ -4775,7 +4959,13 @@ new function() {
 			if (offset)
 				ctx.translate(-offset.x, -offset.y);
 		}
-		this._draw(ctx, param, viewMatrix, strokeMatrix);
+		if (inside) {
+			param.cull = null;
+			this._draw(ctx, param, viewMatrix, strokeMatrix);
+			param.cull = cull;
+		} else {
+			this._draw(ctx, param, viewMatrix, strokeMatrix);
+		}
 		ctx.restore();
 		matrices.pop();
 		if (param.clip && !param.dontFinish) {
@@ -6046,6 +6236,8 @@ var Raster = Item.extend({
 		for (var i = 0, l = views.length; i < l; i++) {
 			var view = views[i];
 			if (view._project) {
+				if (view._cache)
+					view._cache.stale = true;
 				view._needsUpdate = true;
 				if (!view._requested && view._autoUpdate)
 					view.requestUpdate();
@@ -9860,6 +10052,109 @@ new function() {
 		}
 	}
 
+	function drawDashRuns(ctx, path, param, viewMatrix, strokeMatrix, style) {
+		var cull = param.cull,
+			segments = path._segments,
+			length = segments.length,
+			coords = new Array(6),
+			xs = new Array(length),
+			ys = new Array(length),
+			minX = Infinity,
+			minY = Infinity,
+			maxX = -Infinity,
+			maxY = -Infinity,
+			i, x, y;
+		if (length < 2 || style.hasShadow())
+			return false;
+		for (i = 0; i < length; i++) {
+			var segment = segments[i];
+			if (!segment._handleIn.isZero() || !segment._handleOut.isZero())
+				return false;
+			segment._transformCoordinates(strokeMatrix, coords);
+			x = xs[i] = coords[0];
+			y = ys[i] = coords[1];
+			if (x < minX)
+				minX = x;
+			if (x > maxX)
+				maxX = x;
+			if (y < minY)
+				minY = y;
+			if (y > maxY)
+				maxY = y;
+		}
+		if (!(maxX - minX >= 3 * (cull.right - cull.left)
+				|| maxY - minY >= 3 * (cull.bottom - cull.top)))
+			return false;
+		var reach = style.getStrokeWidth() / 2 * Math.max(
+					style.getStrokeJoin() === 'miter'
+						? style.getMiterLimit() : 1,
+					style.getStrokeCap() === 'square' ? Math.SQRT2 : 1, 1)
+					+ 2,
+			left = cull.left - reach,
+			top = cull.top - reach,
+			right = cull.right + reach,
+			bottom = cull.bottom + reach,
+			offset = style.getDashOffset() || 0,
+			done = 0,
+			open = false,
+			t0, t1;
+		if (!(reach < Infinity))
+			return false;
+		function clip(p, q) {
+			if (p === 0)
+				return q >= 0;
+			var r = q / p;
+			if (p < 0) {
+				if (r > t1)
+					return false;
+				if (r > t0)
+					t0 = r;
+			} else {
+				if (r < t0)
+					return false;
+				if (r < t1)
+					t1 = r;
+			}
+			return true;
+		}
+		path._setStyles(ctx, param, viewMatrix);
+		for (i = 1; i < length; i++) {
+			var x0 = xs[i - 1],
+				y0 = ys[i - 1],
+				dx = xs[i] - x0,
+				dy = ys[i] - y0,
+				segmentLength = Math.sqrt(dx * dx + dy * dy);
+			t0 = 0;
+			t1 = 1;
+			if (clip(-dx, x0 - left) && clip(dx, right - x0)
+					&& clip(-dy, y0 - top) && clip(dy, bottom - y0)
+					&& t0 < t1) {
+				if (!open || t0 > 0) {
+					if (open)
+						ctx.stroke();
+					ctx.beginPath();
+					ctx.lineDashOffset = offset + done + t0 * segmentLength;
+					ctx.moveTo(t0 > 0 ? x0 + t0 * dx : x0,
+							t0 > 0 ? y0 + t0 * dy : y0);
+					open = true;
+				}
+				ctx.lineTo(t1 < 1 ? x0 + t1 * dx : xs[i],
+						t1 < 1 ? y0 + t1 * dy : ys[i]);
+				if (t1 < 1) {
+					ctx.stroke();
+					open = false;
+				}
+			} else if (open) {
+				ctx.stroke();
+				open = false;
+			}
+			done += segmentLength;
+		}
+		if (open)
+			ctx.stroke();
+		return true;
+	}
+
 	function drawSegments(ctx, path, matrix) {
 		var segments = path._segments,
 			length = segments.length,
@@ -9927,6 +10222,13 @@ new function() {
 				dashArray = style.getDashArray(),
 				dashLength = !paper.support.nativeDash && hasStroke
 						&& dashArray && dashArray.length;
+
+			if (param.cull && Path.dashCull && strokeMatrix && hasStroke
+					&& !hasFill && !dontStart && !dontPaint && !this._closed
+					&& !dashLength && dashArray && dashArray.length
+					&& drawDashRuns(ctx, this, param, viewMatrix,
+						strokeMatrix, style))
+				return;
 
 			if (!dontStart)
 				ctx.beginPath();
@@ -10228,6 +10530,8 @@ new function() {
 	},
 
 statics: {
+	dashCull: true,
+
 	getBounds: function(segments, closed, path, matrix, options, strokePadding) {
 		var first = segments[0];
 		if (!first)
@@ -13314,6 +13618,8 @@ var View = Base.extend(Emitter, {
 						that._resizeWhenShown = size.isNaN() || size.isZero();
 						if (!that._resizeWhenShown)
 							that.setViewSize(size);
+						else
+							that._dropCache();
 					}
 				});
 			}
@@ -13439,6 +13745,39 @@ var View = Base.extend(Emitter, {
 
 	pause: function() {
 		this._animate = false;
+	},
+
+	beginInteraction: function(kind) {
+		var interactions = this._interactions || (this._interactions = {});
+		interactions[kind || 'pan'] = true;
+		return !!(this.cacheEnabled && this._context && this._autoUpdate);
+	},
+
+	endInteraction: function(kind) {
+		var interactions = this._interactions;
+		kind = kind || 'pan';
+		if (!interactions || !interactions[kind])
+			return false;
+		delete interactions[kind];
+		var left = false;
+		for (var key in interactions)
+			left = true;
+		if (!left)
+			this._interactions = null;
+		if (this._cache || this._cacheDrawn) {
+			if (!left) {
+				this._dropCache(true);
+				this._cacheDrawn = false;
+			}
+			this._needsUpdate = true;
+			if (!this._requested && this._autoUpdate)
+				this.requestUpdate();
+		}
+		return true;
+	},
+
+	_dropCache: function() {
+		this._cache = null;
 	},
 
 	_handleFrame: function() {
@@ -14045,6 +14384,8 @@ var CanvasView = View.extend({
 	_setElementSize: function _setElementSize(width, height) {
 		var previous = this._pixelRatio,
 			pixelRatio = this._nativePixelRatio || previous;
+		this._dropCache();
+		this._seed = null;
 		if (width > 0 && height > 0)
 			pixelRatio = Math.min(pixelRatio,
 					CanvasView.MAX_SIDE / width, CanvasView.MAX_SIDE / height,
@@ -14116,13 +14457,354 @@ var CanvasView = View.extend({
 		var project = this._project,
 			ctx = this._context,
 			size = this._viewSize;
-		ctx.clearRect(0, 0, size.width + 1, size.height + 1);
-		if (project)
-			project.draw(ctx, this._matrix, this._pixelRatio);
+		if (!(project && this._interactions && this.cacheEnabled
+				&& this._updateFromCache(project, ctx, size))) {
+			this._dropCache(this.cacheEnabled);
+			ctx.clearRect(0, 0, size.width + 1, size.height + 1);
+			if (project) {
+				project.draw(ctx, this._matrix, this._pixelRatio,
+						Item._getCullArea(this._matrix, 0, 0, size.width,
+							size.height));
+				this._seed = this._getSeed(project);
+			}
+		}
 		this._needsUpdate = false;
+		return true;
+	},
+
+	cacheEnabled: true,
+
+	cacheLiveLayer: 'rulers',
+
+	_updateFromCache: function(project, ctx, size) {
+		var matrix = this._matrix,
+			pixelRatio = this._pixelRatio,
+			top = this._getLiveIndex(project),
+			cache = this._getCache(project, top);
+		if (!cache)
+			return false;
+		var marginX = cache.marginX,
+			marginY = cache.marginY,
+			width = cache.canvas.width,
+			height = cache.canvas.height,
+			viewWidth = width - 2 * marginX,
+			viewHeight = height - 2 * marginY,
+			dx = 0,
+			dy = 0,
+			scaled = false;
+		if (cache.b !== matrix._b || cache.c !== matrix._c) {
+			this._resetCache(project, top);
+		} else if (cache.a === matrix._a && cache.d === matrix._d) {
+			dx = Math.round((matrix._tx - cache.tx) * pixelRatio);
+			dy = Math.round((matrix._ty - cache.ty) * pixelRatio);
+			if (Math.abs(dx) > marginX || Math.abs(dy) > marginY) {
+				if (Math.abs(dx) < width && Math.abs(dy) < height)
+					this._moveCache(dx, dy);
+				else
+					this._resetCache(project, top);
+				dx = Math.round((matrix._tx - cache.tx) * pixelRatio);
+				dy = Math.round((matrix._ty - cache.ty) * pixelRatio);
+			}
+		} else if (this._interactions.zoom) {
+			scaled = this._drawScaledCache(project, ctx);
+			if (!scaled && cache.valid) {
+				this._dropCache(true);
+				return false;
+			}
+			if (!scaled)
+				this._resetCache(project, top);
+		} else {
+			this._resetCache(project, top);
+		}
+		if (!scaled && !cache.valid) {
+			this._setCacheMatrix(matrix);
+			ctx.clearRect(0, 0, size.width + 1, size.height + 1);
+			project._drawLayers(ctx, matrix, pixelRatio, 0, top,
+					Item._getCullArea(matrix, 0, 0, size.width, size.height));
+			this._copyViewIntoCache();
+		} else if (!scaled) {
+			this._fillCache(project, marginX - dx, marginY - dy,
+					marginX - dx + viewWidth, marginY - dy + viewHeight);
+			ctx.save();
+			ctx.setTransform(1, 0, 0, 1, 0, 0);
+			ctx.globalCompositeOperation = 'copy';
+			ctx.drawImage(cache.canvas, dx - marginX, dy - marginY);
+			ctx.restore();
+		}
+		project._drawLayers(ctx, matrix, pixelRatio, top,
+				project._children.length,
+				Item._getCullArea(matrix, 0, 0, size.width, size.height));
+		project._drawSelection(ctx, matrix);
+		this._seed = null;
+		this._cacheDrawn = true;
+		return true;
+	},
+
+	_dropCache: function(keep) {
+		var cache = this._cache,
+			spare = this._spare,
+			that = this;
+		this._cache = null;
+		if (cache && keep) {
+			if (spare && spare !== cache.canvas)
+				spare.width = spare.height = 0;
+			spare = this._spare = cache.canvas;
+			clearTimeout(this._spareTimer);
+			this._spareTimer = setTimeout(function() {
+				if (that._spare === spare) {
+					that._spare = null;
+					spare.width = spare.height = 0;
+				}
+			}, CanvasView.CACHE_RELEASE_MS);
+		} else {
+			if (cache)
+				cache.canvas.width = cache.canvas.height = 0;
+			if (!keep && spare) {
+				this._spare = null;
+				spare.width = spare.height = 0;
+			}
+		}
+	},
+
+	_getLiveIndex: function(project) {
+		var layers = project._children;
+		for (var i = 0, l = layers.length; i < l; i++) {
+			if (layers[i]._name === this.cacheLiveLayer)
+				return i;
+		}
+		return layers.length;
+	},
+
+	_getSeed: function(project) {
+		var layers = project._children,
+			top = this._getLiveIndex(project),
+			matrix = this._matrix,
+			size = this._viewSize;
+		if (project._selectionCount > 0)
+			return null;
+		for (var i = top, l = layers.length; i < l; i++) {
+			var layer = layers[i];
+			if (layer._visible && layer._opacity > 0 && layer._children.length)
+				return null;
+		}
+		return {
+			top: top, pixelRatio: this._pixelRatio,
+			width: size.width, height: size.height,
+			a: matrix._a, b: matrix._b, c: matrix._c, d: matrix._d,
+			tx: matrix._tx, ty: matrix._ty, dirty: false
+		};
+	},
+
+	_getCache: function(project, top) {
+		var size = this._viewSize,
+			pixelRatio = this._pixelRatio,
+			element = this._element,
+			cache = this._cache,
+			marginX = Math.round(size.width * pixelRatio
+					* CanvasView.CACHE_MARGIN),
+			marginY = Math.round(size.height * pixelRatio
+					* CanvasView.CACHE_MARGIN),
+			width = element.width + 2 * marginX,
+			height = element.height + 2 * marginY;
+		if (cache && cache.canvas.width === width
+				&& cache.canvas.height === height
+				&& cache.pixelRatio === pixelRatio
+				&& cache.width === size.width && cache.height === size.height) {
+			if (cache.stale || cache.top !== top)
+				this._resetCache(project, top);
+			return cache;
+		}
+		this._dropCache(true);
+		var canvas = this._spare,
+			context;
+		this._spare = null;
+		if (canvas && (canvas.width !== width || canvas.height !== height)) {
+			canvas.width = canvas.height = 0;
+			canvas = null;
+		}
+		if (!canvas) {
+			canvas = document.createElement('canvas');
+			canvas.width = width;
+			canvas.height = height;
+		}
+		context = canvas.getContext('2d');
+		if (!context || canvas.width !== width || canvas.height !== height)
+			return null;
+		this._cache = cache = {
+			canvas: canvas, context: context, pixelRatio: pixelRatio,
+			width: size.width, height: size.height,
+			marginX: marginX, marginY: marginY,
+			chunkX: Math.round(marginX * CanvasView.CACHE_CHUNK),
+			chunkY: Math.round(marginY * CanvasView.CACHE_CHUNK)
+		};
+		this._resetCache(project, top);
+		return cache;
+	},
+
+	_resetCache: function(project, top) {
+		var cache = this._cache,
+			matrix = this._matrix,
+			seed = this._seed;
+		cache.stale = false;
+		cache.top = top;
+		if (seed && !seed.dirty && seed.top === top
+				&& seed.pixelRatio === cache.pixelRatio
+				&& seed.width === cache.width && seed.height === cache.height
+				&& seed.b === matrix._b && seed.c === matrix._c) {
+			this._copyViewIntoCache();
+			this._setCacheMatrix({ _a: seed.a, _b: seed.b, _c: seed.c,
+					_d: seed.d, _tx: seed.tx, _ty: seed.ty });
+			cache.seeded = true;
+		} else {
+			project._updateVersion++;
+			cache.valid = null;
+			this._setCacheMatrix(matrix);
+			cache.seeded = false;
+		}
+		this._seed = null;
+	},
+
+	_setCacheMatrix: function(matrix) {
+		var cache = this._cache;
+		cache.a = matrix._a;
+		cache.b = matrix._b;
+		cache.c = matrix._c;
+		cache.d = matrix._d;
+		cache.tx = matrix._tx;
+		cache.ty = matrix._ty;
+	},
+
+	_copyViewIntoCache: function() {
+		var cache = this._cache,
+			context = cache.context,
+			element = this._element;
+		context.save();
+		context.setTransform(1, 0, 0, 1, 0, 0);
+		context.globalCompositeOperation = 'copy';
+		context.drawImage(element, cache.marginX, cache.marginY);
+		context.restore();
+		cache.valid = [cache.marginX, cache.marginY,
+				cache.marginX + element.width, cache.marginY + element.height];
+	},
+
+	_fillCache: function(project, x0, y0, x1, y1) {
+		var cache = this._cache,
+			width = cache.canvas.width,
+			height = cache.canvas.height,
+			valid = cache.valid;
+		x0 = Math.max(0, Math.floor(x0));
+		y0 = Math.max(0, Math.floor(y0));
+		x1 = Math.min(width, Math.ceil(x1));
+		y1 = Math.min(height, Math.ceil(y1));
+		if (!(x0 < x1 && y0 < y1))
+			return;
+		if (!valid) {
+			this._drawCache(project, x0, y0, x1 - x0, y1 - y0);
+			cache.valid = [x0, y0, x1, y1];
+			return;
+		}
+		var u0 = valid[0], v0 = valid[1], u1 = valid[2], v1 = valid[3];
+		if (x0 >= u0 && y0 >= v0 && x1 <= u1 && y1 <= v1)
+			return;
+		var n0 = x0 < u0 ? Math.max(0, x0 - cache.chunkX) : u0,
+			m0 = y0 < v0 ? Math.max(0, y0 - cache.chunkY) : v0,
+			n1 = x1 > u1 ? Math.min(width, x1 + cache.chunkX) : u1,
+			m1 = y1 > v1 ? Math.min(height, y1 + cache.chunkY) : v1;
+		if (m0 < v0)
+			this._drawCache(project, n0, m0, n1 - n0, v0 - m0);
+		if (m1 > v1)
+			this._drawCache(project, n0, v1, n1 - n0, m1 - v1);
+		if (n0 < u0)
+			this._drawCache(project, n0, v0, u0 - n0, v1 - v0);
+		if (n1 > u1)
+			this._drawCache(project, u1, v0, n1 - u1, v1 - v0);
+		cache.valid = [n0, m0, n1, m1];
+	},
+
+	_moveCache: function(dx, dy) {
+		var cache = this._cache,
+			context = cache.context,
+			valid = cache.valid,
+			width = cache.canvas.width,
+			height = cache.canvas.height;
+		context.save();
+		context.setTransform(1, 0, 0, 1, 0, 0);
+		context.globalCompositeOperation = 'copy';
+		context.drawImage(cache.canvas, dx, dy);
+		context.restore();
+		cache.tx += dx / cache.pixelRatio;
+		cache.ty += dy / cache.pixelRatio;
+		if (valid) {
+			var x0 = Math.max(0, valid[0] + dx),
+				y0 = Math.max(0, valid[1] + dy),
+				x1 = Math.min(width, valid[2] + dx),
+				y1 = Math.min(height, valid[3] + dy);
+			cache.valid = x0 < x1 && y0 < y1 ? [x0, y0, x1, y1] : null;
+		}
+	},
+
+	_drawCache: function(project, x, y, width, height) {
+		var cache = this._cache,
+			context = cache.context,
+			ctx = this._context,
+			pixelRatio = cache.pixelRatio,
+			matrix = new Matrix(1, 0, 0, 1, cache.marginX / pixelRatio,
+				cache.marginY / pixelRatio).append(new Matrix(cache.a,
+					cache.b, cache.c, cache.d, cache.tx, cache.ty));
+		context.save();
+		context.setTransform(1, 0, 0, 1, 0, 0);
+		context.beginPath();
+		context.rect(x, y, width, height);
+		context.clip();
+		context.clearRect(x, y, width, height);
+		context.imageSmoothingEnabled = ctx.imageSmoothingEnabled;
+		context.imageSmoothingQuality = ctx.imageSmoothingQuality;
+		context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+		project._drawLayers(context, matrix, pixelRatio, 0, cache.top,
+				Item._getCullArea(matrix, x / pixelRatio, y / pixelRatio,
+					(x + width) / pixelRatio, (y + height) / pixelRatio));
+		context.restore();
+	},
+
+	_drawScaledCache: function(project, ctx) {
+		var cache = this._cache,
+			matrix = this._matrix,
+			pixelRatio = this._pixelRatio,
+			canvas = ctx.canvas,
+			scale = matrix._a / cache.a,
+			x = pixelRatio * matrix._tx
+				- scale * (cache.marginX + pixelRatio * cache.tx),
+			y = pixelRatio * matrix._ty
+				- scale * (cache.marginY + pixelRatio * cache.ty),
+			x0 = -x / scale - 1,
+			y0 = -y / scale - 1,
+			x1 = (canvas.width - x) / scale + 1,
+			y1 = (canvas.height - y) / scale + 1;
+		var valid = cache.valid;
+		if (!(scale > 0 && Math.abs(matrix._d / cache.d - scale) < 1e-9
+				&& valid && x0 >= valid[0] && y0 >= valid[1]
+				&& x1 <= valid[2] && y1 <= valid[3]))
+			return false;
+		x0 = Math.floor(x0);
+		y0 = Math.floor(y0);
+		x1 = Math.ceil(x1);
+		y1 = Math.ceil(y1);
+		ctx.save();
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.clearRect(0, 0, canvas.width, canvas.height);
+		ctx.setTransform(scale, 0, 0, scale, x, y);
+		ctx.imageSmoothingEnabled = true;
+		ctx.drawImage(cache.canvas, x0, y0, x1 - x0, y1 - y0, x0, y0,
+				x1 - x0, y1 - y0);
+		ctx.restore();
 		return true;
 	}
 });
+
+CanvasView.CACHE_MARGIN = 0.25;
+CanvasView.CACHE_CHUNK = 0.5;
+
+CanvasView.CACHE_RELEASE_MS = 3000;
 
 CanvasView.MAX_SIDE = 16384;
 CanvasView.MAX_AREA = 64 * 1024 * 1024;
