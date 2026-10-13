@@ -9,7 +9,7 @@
  *
  * All rights reserved.
  *
- * Date: Sun Sep 27 23:13:45 2026 +0200
+ * Date: Tue Oct 13 09:00:00 2026 +0200
  *
  ***
  *
@@ -5786,14 +5786,459 @@ var Raster = Item.extend({
 				disabled ? false : smoothing
 			);
 
-			ctx.drawImage(element,
-					-this._size.width / 2, -this._size.height / 2);
+			var size = this._size,
+				copy = param.updateMatrix && !disabled
+					&& Raster._screenCopy(this, element, viewMatrix,
+						param.pixelRatio);
+			if (copy && copy.width !== element.naturalWidth) {
+				ctx.drawImage(copy, -size.width / 2, -size.height / 2,
+						element.naturalWidth, element.naturalHeight);
+			} else {
+				ctx.drawImage(copy || element,
+						-size.width / 2, -size.height / 2);
+			}
 		}
 	},
 
 	_canComposite: function() {
 		return true;
 	}
+}, new function() {
+
+	var entries = [],
+		timer = null,
+		SLICE = 1 << 20,
+		STRIP = 500000,
+		vector = /^data:image\/(svg|gif)/i,
+		animated = /\.(svg|gif)([?#]|$)/i;
+
+	function getEntry(element, width, height, config) {
+		var src = element.getAttribute('src') || '';
+		for (var i = 0, l = entries.length; i < l; i++) {
+			var entry = entries[i];
+			if (entry.element === element) {
+				if (entry.src === src)
+					return entry;
+				drop(entry);
+				break;
+			}
+		}
+		var levels = [{ width: width, height: height, ratio: 1 }],
+			minSide = Math.max(+config.minSide || 0, 1),
+			w = width,
+			h = height;
+		while (Math.max(w, h) > minSide) {
+			w = Math.max(1, Math.round(w / 2));
+			h = Math.max(1, Math.round(h / 2));
+			levels.push({ width: w, height: h,
+					ratio: Math.min(w / width, h / height) });
+		}
+		entry = { element: element, src: src, levels: levels, views: [],
+				ready: false, making: false, failed: false, dropped: false,
+				shown: null, raster: null };
+		entries.push(entry);
+		if (vector.test(src.slice(0, 15)) || !/^data:/.test(src)
+				&& animated.test(src)) {
+			entry.failed = true;
+		} else {
+			build(entry, 0);
+			schedule(+config.releaseMs || 0);
+		}
+		return entry;
+	}
+
+	function build(entry, from) {
+		var levels = entry.levels,
+			chain;
+		entry.making = true;
+		try {
+			chain = levels[from].image
+					? Promise.resolve(levels[from].image)
+					: decode(entry.src).then(function(file) {
+						return copy(file.bitmap, levels[0], file.png);
+					}).then(function(image) {
+						return keep(entry, 0, image);
+					});
+			for (var i = from + 1, l = levels.length; i < l; i++)
+				chain = chain.then(halveTo(entry, i));
+		} catch (e) {
+			entry.making = false;
+			return fail(entry, e);
+		}
+		chain.then(function() {
+			entry.making = false;
+			if (!entry.dropped && !entry.failed) {
+				entry.ready = true;
+				redraw(entry);
+			}
+		}, function(error) {
+			entry.making = false;
+			fail(entry, error);
+		});
+	}
+
+	function halveTo(entry, index) {
+		return function(source) {
+			var level = entry.levels[index];
+			if (entry.dropped || entry.failed)
+				throw new Error('no longer wanted');
+			return level.image || halve(source, level).then(function(image) {
+				return keep(entry, index, image);
+			});
+		};
+	}
+
+	function decode(src) {
+		return fileOf(src).then(function(blob) {
+			return self.createImageBitmap(blob).then(function(bitmap) {
+				return { bitmap: bitmap, png: blob.type === 'image/png' };
+			});
+		});
+	}
+
+	function fileOf(src) {
+		var match = /^data:([^,;]*)[^,]*?(;base64)?,/.exec(src);
+		if (!match || !match[2]) {
+			return fetch(src).then(function(response) {
+				return response.blob();
+			});
+		}
+		var at = match[0].length,
+			parts = [];
+		return new Promise(function(resolve, reject) {
+			function slice() {
+				try {
+					var end = Math.min(src.length, at + SLICE),
+						chars = atob(src.slice(at, end)),
+						bytes = new Uint8Array(chars.length);
+					for (var i = 0, l = chars.length; i < l; i++)
+						bytes[i] = chars.charCodeAt(i);
+					parts.push(bytes);
+					at = end;
+					if (at < src.length) {
+						setTimeout(slice, 0);
+					} else {
+						resolve(new Blob(parts, { type: match[1] }));
+					}
+				} catch (e) {
+					reject(e);
+				}
+			}
+			setTimeout(slice, 0);
+		});
+	}
+
+	function canvasOf(level) {
+		var canvas = document.createElement('canvas');
+		canvas.width = level.width;
+		canvas.height = level.height;
+		return canvas;
+	}
+
+	function strips(canvas, draw) {
+		var width = canvas.width,
+			height = canvas.height,
+			rows = Math.max(1, Math.floor(STRIP / width)),
+			y = 0;
+		return new Promise(function(resolve, reject) {
+			function strip() {
+				var next = Math.min(height, y + rows);
+				new Promise(function(drawn) {
+					drawn(draw(y, next));
+				}).then(function() {
+					y = next;
+					if (y < height) {
+						setTimeout(strip, 0);
+					} else {
+						resolve(canvas);
+					}
+				}).then(null, reject);
+			}
+			strip();
+		});
+	}
+
+	function copy(bitmap, level, cut) {
+		var canvas = canvasOf(level),
+			ctx = canvas.getContext('2d'),
+			width = level.width;
+		ctx.imageSmoothingEnabled = false;
+		if (bitmap.width !== width || bitmap.height !== level.height) {
+			release(bitmap);
+			return Promise.reject(new Error('a ' + bitmap.width + 'x'
+					+ bitmap.height + ' picture for ' + width + 'x'
+					+ level.height));
+		}
+		return (cut ? strips(canvas, function(y, next) {
+			return self.createImageBitmap(bitmap, 0, y, width, next - y)
+					.then(function(part) {
+				ctx.drawImage(part, 0, y);
+				release(part);
+			});
+		}) : new Promise(function(resolve) {
+			ctx.drawImage(bitmap, 0, 0);
+			resolve(canvas);
+		})).then(function(canvas) {
+			release(bitmap);
+			return canvas;
+		}, function(error) {
+			release(bitmap);
+			release(canvas);
+			throw error;
+		});
+	}
+
+	function halve(source, level) {
+		var canvas = canvasOf(level),
+			ctx = canvas.getContext('2d');
+		ctx.imageSmoothingEnabled = true;
+		ctx.imageSmoothingQuality = 'low';
+		return strips(canvas, function(y, next) {
+			ctx.save();
+			ctx.beginPath();
+			ctx.rect(0, y, canvas.width, next - y);
+			ctx.clip();
+			ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+			ctx.restore();
+		});
+	}
+
+	function keep(entry, index, image) {
+		var level = entry.levels[index];
+		if (entry.dropped || entry.failed) {
+			release(image);
+			throw new Error('no longer wanted');
+		}
+		if (image.width !== level.width || image.height !== level.height) {
+			release(image);
+			throw new Error('a ' + image.width + 'x' + image.height
+					+ ' copy for ' + level.width + 'x' + level.height);
+		}
+		release(level.image);
+		level.image = image;
+		level.used = Date.now();
+		return image;
+	}
+
+	function remake(entry, index) {
+		var levels = entry.levels,
+			from = index;
+		while (from > 0 && !levels[from].image)
+			from--;
+		build(entry, from);
+	}
+
+	function nearest(levels, index) {
+		for (var i = index - 1; i >= 0; i--) {
+			if (levels[i].image)
+				return levels[i];
+		}
+		for (var j = index + 1, l = levels.length; j < l; j++) {
+			if (levels[j].image)
+				return levels[j];
+		}
+		return null;
+	}
+
+	function redraw(entry) {
+		var views = entry.views;
+		entry.views = [];
+		for (var i = 0, l = views.length; i < l; i++) {
+			var view = views[i];
+			if (view._project) {
+				view._needsUpdate = true;
+				if (!view._requested && view._autoUpdate)
+					view.requestUpdate();
+			}
+		}
+	}
+
+	function release(image) {
+		if (image) {
+			if (image.close) {
+				image.close();
+			} else {
+				image.width = image.height = 0;
+			}
+		}
+	}
+
+	function lost(level) {
+		var ctx = level.image.getContext && level.image.getContext('2d');
+		return !!(ctx && ctx.isContextLost && ctx.isContextLost());
+	}
+
+	function closeAll(entry) {
+		var levels = entry.levels;
+		for (var i = 0, l = levels.length; i < l; i++) {
+			release(levels[i].image);
+			levels[i].image = null;
+		}
+	}
+
+	function drop(entry) {
+		entry.dropped = true;
+		closeAll(entry);
+		entry.views = [];
+		entry.shown = entry.raster = null;
+		var index = entries.indexOf(entry);
+		if (index !== -1)
+			entries.splice(index, 1);
+	}
+
+	function fail(entry, error) {
+		if (entry.dropped || entry.failed)
+			return;
+		entry.failed = true;
+		closeAll(entry);
+		redraw(entry);
+		var hook = Raster.screenCopiesFailed;
+		if (hook) {
+			try {
+				hook('Screen copies of a ' + entry.levels[0].width + 'x'
+						+ entry.levels[0].height + ' picture could not be'
+						+ ' made, it is drawn as before: '
+						+ (error && error.message || error));
+			} catch (e) {
+			}
+		}
+	}
+
+	function isShown(item) {
+		var view = item._project && item._project._view;
+		if (!view || !item.isInserted() || !view.isVisible())
+			return false;
+		for (; item; item = item._parent) {
+			if (!item._visible)
+				return false;
+		}
+		return true;
+	}
+
+	function schedule(delay) {
+		if (!timer)
+			timer = setTimeout(sweep, Math.max(delay, 0) + 50);
+	}
+
+	function sweep() {
+		timer = null;
+		var config = Raster.screenCopies,
+			releaseMs = config && +config.releaseMs || 0,
+			now = Date.now(),
+			next = Infinity;
+		for (var i = entries.length - 1; i >= 0; i--) {
+			var entry = entries[i];
+			if (!config) {
+				drop(entry);
+				continue;
+			}
+			if (entry.failed)
+				continue;
+			if (entry.making) {
+				next = Math.min(next, releaseMs);
+				continue;
+			}
+			var levels = entry.levels,
+				held = false;
+			try {
+				var kept = entry.shown && isShown(entry.raster)
+						? entry.shown : null;
+				for (var j = 0, l = levels.length; j < l; j++) {
+					var level = levels[j],
+						idle = now - level.used;
+					if (!level.image)
+						continue;
+					if (level !== kept && idle >= releaseMs) {
+						release(level.image);
+						level.image = null;
+					} else {
+						held = true;
+						next = Math.min(next, level === kept ? releaseMs
+								: releaseMs - idle);
+					}
+				}
+			} catch (e) {
+				held = false;
+			}
+			if (!held)
+				drop(entry);
+		}
+		if (next < Infinity)
+			schedule(next);
+	}
+
+	return {
+		statics: {
+			screenCopies: { minPixels: 4e6, minSide: 1024, releaseMs: 30000 },
+
+			screenCopiesFailed: function(message) {
+				var list = self.pseudoErrors;
+				if (list && typeof list.push === 'function')
+					list.push(JSON.stringify({ message: message,
+							time: Date.now() }));
+			},
+
+			_screenCopies: entries,
+
+			_screenCopy: function(raster, element, matrix, pixelRatio) {
+				var config = Raster.screenCopies;
+				if (!config || !matrix || element.getContext
+						|| !element.complete || !self.createImageBitmap)
+					return null;
+				var width = element.naturalWidth,
+					height = element.naturalHeight,
+					entry = null;
+				if (!(width * height >= config.minPixels))
+					return null;
+				try {
+					entry = getEntry(element, width, height, config);
+					if (entry.failed)
+						return null;
+					var scale = Math.max(
+							Math.sqrt(matrix._a * matrix._a
+								+ matrix._b * matrix._b),
+							Math.sqrt(matrix._c * matrix._c
+								+ matrix._d * matrix._d))
+							* (pixelRatio || 1),
+						levels = entry.levels,
+						index = 0;
+					if (scale <= 0.5) {
+						while (index + 1 < levels.length
+								&& levels[index + 1].ratio >= scale)
+							index++;
+					}
+					var level = levels[index],
+						drawn = level.image ? level : null;
+					if (drawn && lost(drawn)) {
+						drop(entry);
+						entry = getEntry(element, width, height, config);
+						levels = entry.levels;
+						drawn = null;
+					}
+					if (!drawn) {
+						if (entry.ready) {
+							if (!entry.making)
+								remake(entry, index);
+							drawn = nearest(levels, index);
+						}
+						var view = raster._project && raster._project._view;
+						if (view && entry.views.indexOf(view) === -1)
+							entry.views.push(view);
+						if (!drawn)
+							return null;
+					}
+					drawn.used = Date.now();
+					entry.shown = drawn;
+					entry.raster = raster;
+					return drawn.image;
+				} catch (e) {
+					if (entry)
+						fail(entry, e);
+					return null;
+				}
+			}
+		}
+	};
 });
 
 var SymbolItem = Item.extend({
