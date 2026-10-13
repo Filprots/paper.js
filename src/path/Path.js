@@ -2302,7 +2302,7 @@ new function() { // Scope for drawing
             }
             return true;
         }
-        path._setStyles(ctx, param, viewMatrix);
+        path._setStyles(ctx, param, viewMatrix, strokeMatrix);
         for (i = 1; i < length; i++) {
             var x0 = xs[i - 1],
                 y0 = ys[i - 1],
@@ -2442,9 +2442,9 @@ new function() { // Scope for drawing
             if (!dontPaint && (hasFill || hasStroke)) {
                 // If the path is part of a compound path or doesn't have a fill
                 // or stroke, there is no need to continue.
-                this._setStyles(ctx, param, viewMatrix);
+                this._setStyles(ctx, param, viewMatrix, strokeMatrix);
                 if (hasFill) {
-                    ctx.fill(style.getFillRule());
+                    this._fill(ctx, strokeMatrix);
                     // If shadowColor is defined, clear it after fill, so it
                     // won't be applied to both fill and stroke. If the path is
                     // only stroked, we don't have to clear it.

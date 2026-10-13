@@ -4411,8 +4411,11 @@ new function() { // Injection scope for hit-test functions shared with project
      * Private method that sets Path related styles on the canvas context.
      * Not defined in Path as it is required by other classes too,
      * e.g. PointText.
+     * IRRIS: strokeMatrix, the item's matrix for non-scaling strokes (see
+     * #draw()): its stroke is drawn in screen px, so a gradient on it is made
+     * there (Color#toCanvasStyle()); a gradient fill, see #_fill().
      */
-    _setStyles: function(ctx, param, viewMatrix) {
+    _setStyles: function(ctx, param, viewMatrix, strokeMatrix) {
         // We can access internal properties since we're only using this on
         // items without children, where styles would be merged.
         var style = this._style,
@@ -4421,7 +4424,8 @@ new function() { // Injection scope for hit-test functions shared with project
             ctx.fillStyle = style.getFillColor().toCanvasStyle(ctx, matrix);
         }
         if (style.hasStroke()) {
-            ctx.strokeStyle = style.getStrokeColor().toCanvasStyle(ctx, matrix);
+            ctx.strokeStyle = style.getStrokeColor().toCanvasStyle(ctx, matrix,
+                    strokeMatrix);
             ctx.lineWidth = style.getStrokeWidth();
             var strokeJoin = style.getStrokeJoin(),
                 strokeCap = style.getStrokeCap(),
@@ -4461,6 +4465,26 @@ new function() { // Injection scope for hit-test functions shared with project
             ctx.shadowBlur = blur.getLength();
             ctx.shadowOffsetX = offset.x;
             ctx.shadowOffsetY = offset.y;
+        }
+    },
+
+    /**
+     * IRRIS: fills the path on the context with this item's fill (set by
+     * #_setStyles()). A non-scaling item's path is built in screen px (its
+     * strokeMatrix, see #draw()) while a gradient fill is in its own
+     * coordinates: the context takes the strokeMatrix for that fill, so the
+     * gradient lands on the item at every zoom (it landed in screen px, far
+     * from the item: a flat colour or nothing).
+     */
+    _fill: function(ctx, strokeMatrix) {
+        var style = this._style;
+        if (strokeMatrix && style.getFillColor()._type === 'gradient') {
+            ctx.save();
+            strokeMatrix.applyToContext(ctx);
+            ctx.fill(style.getFillRule());
+            ctx.restore();
+        } else {
+            ctx.fill(style.getFillRule());
         }
     },
 
@@ -4722,12 +4746,24 @@ new function() { // Injection scope for hit-test functions shared with project
             // on the temporary canvas.
             ctx.translate(-itemOffset.x, -itemOffset.y);
         }
-        if (transform) {
+        if (clip) {
+            // IRRIS: the clip item is a sibling of this item (Group#_draw()),
+            // so it is drawn again in the parent's space, on the context and
+            // on the stack of global matrices, and this item's own matrix is
+            // applied after it. Drawn in this item's space, the clip moved by
+            // the item's own matrix (a Shape keeps its position there) and hid
+            // the item: a see-through or blended Shape with a fill and a
+            // stroke inside a clip group (an imported SVG's) was not drawn.
+            var parentMatrix = matrices[matrices.length - 2];
+            (param.viewMatrix ? param.viewMatrix.appended(parentMatrix)
+                    : parentMatrix).applyToContext(ctx);
+            matrices.pop();
+            param.clipItem.draw(ctx, param.extend({ clip: true }));
+            matrices.push(globalMatrix);
+            matrix.applyToContext(ctx);
+        } else if (transform) {
             // Apply viewMatrix when drawing into temporary canvas.
             (direct ? matrix : viewMatrix).applyToContext(ctx);
-        }
-        if (clip) {
-            param.clipItem.draw(ctx, param.extend({ clip: true }));
         }
         if (strokeMatrix) {
             // Reset the transformation but take HiDPI pixel ratio into account.

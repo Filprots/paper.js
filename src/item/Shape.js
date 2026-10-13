@@ -261,9 +261,9 @@ var Shape = Item.extend(/** @lends Shape# */{
             ctx.closePath();
         }
         if (!dontPaint && (hasFill || hasStroke)) {
-            this._setStyles(ctx, param, viewMatrix);
+            this._setStyles(ctx, param, viewMatrix, strokeMatrix);
             if (hasFill) {
-                ctx.fill(style.getFillRule());
+                this._fill(ctx, strokeMatrix);
                 ctx.shadowColor = 'rgba(0,0,0,0)';
             }
             if (hasStroke)

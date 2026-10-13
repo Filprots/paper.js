@@ -901,8 +901,12 @@ var Color = Base.extend(new function() {
                         + components.join(',') + ')';
         },
 
-        toCanvasStyle: function(ctx, matrix) {
-            if (this._canvasStyle)
+        toCanvasStyle: function(ctx, matrix, screenMatrix) {
+            // IRRIS: screenMatrix, from the item's own coordinates to the
+            // context's screen px (a non-scaling item's stroke, see
+            // Item#_setStyles()): a gradient is made there, for this draw only.
+            var screen = screenMatrix && this._type === 'gradient';
+            if (this._canvasStyle && !screen)
                 return this._canvasStyle;
             // Normal colors are simply represented by their CSS string.
             if (this._type !== 'gradient')
@@ -924,6 +928,29 @@ var Color = Base.extend(new function() {
                 destination = inverse._transformPoint(destination);
                 if (highlight)
                     highlight = inverse._transformPoint(highlight);
+            }
+            if (screen) {
+                // IRRIS: under an affine map a linear gradient's lines of one
+                // colour stay lines: in screen px its vector is the map's
+                // inverse transpose of the local one, scaled to the same
+                // colours. A radial one stays a circle under a uniform scale
+                // only: its radius takes the mean scale.
+                var span = destination.subtract(origin),
+                    m = screenMatrix,
+                    det = m._a * m._d - m._b * m._c;
+                origin = m._transformPoint(origin);
+                if (highlight)
+                    highlight = m._transformPoint(highlight);
+                if (gradient._radial) {
+                    destination = origin.add(span.getLength()
+                            * Math.sqrt(Math.abs(det)), 0);
+                } else {
+                    var normal = new Point(
+                            (m._d * span.x - m._b * span.y) / det,
+                            (m._a * span.y - m._c * span.x) / det);
+                    destination = origin.add(normal.multiply(
+                            span.dot(span) / normal.dot(normal)));
+                }
             }
             if (gradient._radial) {
                 var radius = destination.getDistance(origin);
@@ -950,7 +977,7 @@ var Color = Base.extend(new function() {
                         offset == null ? i / (l - 1) : offset,
                         stop._color.toCanvasStyle());
             }
-            return this._canvasStyle = canvasGradient;
+            return screen ? canvasGradient : this._canvasStyle = canvasGradient;
         },
 
         /**
