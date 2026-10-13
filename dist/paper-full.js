@@ -9,7 +9,7 @@
  *
  * All rights reserved.
  *
- * Date: Tue Oct 13 13:52:05 2026 +0200
+ * Date: Tue Oct 13 16:24:34 2026 +0200
  *
  ***
  *
@@ -4726,14 +4726,15 @@ new function() {
 	}
 }), {
 
-	_setStyles: function(ctx, param, viewMatrix) {
+	_setStyles: function(ctx, param, viewMatrix, strokeMatrix) {
 		var style = this._style,
 			matrix = this._matrix;
 		if (style.hasFill()) {
 			ctx.fillStyle = style.getFillColor().toCanvasStyle(ctx, matrix);
 		}
 		if (style.hasStroke()) {
-			ctx.strokeStyle = style.getStrokeColor().toCanvasStyle(ctx, matrix);
+			ctx.strokeStyle = style.getStrokeColor().toCanvasStyle(ctx, matrix,
+					strokeMatrix);
 			ctx.lineWidth = style.getStrokeWidth();
 			var strokeJoin = style.getStrokeJoin(),
 				strokeCap = style.getStrokeCap(),
@@ -4768,6 +4769,18 @@ new function() {
 			ctx.shadowBlur = blur.getLength();
 			ctx.shadowOffsetX = offset.x;
 			ctx.shadowOffsetY = offset.y;
+		}
+	},
+
+	_fill: function(ctx, strokeMatrix) {
+		var style = this._style;
+		if (strokeMatrix && style.getFillColor()._type === 'gradient') {
+			ctx.save();
+			strokeMatrix.applyToContext(ctx);
+			ctx.fill(style.getFillRule());
+			ctx.restore();
+		} else {
+			ctx.fill(style.getFillRule());
 		}
 	},
 
@@ -4947,11 +4960,16 @@ new function() {
 		} else if (transform) {
 			ctx.translate(-itemOffset.x, -itemOffset.y);
 		}
-		if (transform) {
-			(direct ? matrix : viewMatrix).applyToContext(ctx);
-		}
 		if (clip) {
+			var parentMatrix = matrices[matrices.length - 2];
+			(param.viewMatrix ? param.viewMatrix.appended(parentMatrix)
+					: parentMatrix).applyToContext(ctx);
+			matrices.pop();
 			param.clipItem.draw(ctx, param.extend({ clip: true }));
+			matrices.push(globalMatrix);
+			matrix.applyToContext(ctx);
+		} else if (transform) {
+			(direct ? matrix : viewMatrix).applyToContext(ctx);
 		}
 		if (strokeMatrix) {
 			ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
@@ -5401,9 +5419,9 @@ var Shape = Item.extend({
 			ctx.closePath();
 		}
 		if (!dontPaint && (hasFill || hasStroke)) {
-			this._setStyles(ctx, param, viewMatrix);
+			this._setStyles(ctx, param, viewMatrix, strokeMatrix);
 			if (hasFill) {
-				ctx.fill(style.getFillRule());
+				this._fill(ctx, strokeMatrix);
 				ctx.shadowColor = 'rgba(0,0,0,0)';
 			}
 			if (hasStroke)
@@ -10117,7 +10135,7 @@ new function() {
 			}
 			return true;
 		}
-		path._setStyles(ctx, param, viewMatrix);
+		path._setStyles(ctx, param, viewMatrix, strokeMatrix);
 		for (i = 1; i < length; i++) {
 			var x0 = xs[i - 1],
 				y0 = ys[i - 1],
@@ -10244,9 +10262,9 @@ new function() {
 			}
 
 			if (!dontPaint && (hasFill || hasStroke)) {
-				this._setStyles(ctx, param, viewMatrix);
+				this._setStyles(ctx, param, viewMatrix, strokeMatrix);
 				if (hasFill) {
-					ctx.fill(style.getFillRule());
+					this._fill(ctx, strokeMatrix);
 					ctx.shadowColor = 'rgba(0,0,0,0)';
 				}
 				if (hasStroke) {
@@ -11022,10 +11040,10 @@ var CompoundPath = PathItem.extend({
 			children[i].draw(ctx, param, strokeMatrix);
 
 		if (!param.clip) {
-			this._setStyles(ctx, param, viewMatrix);
+			this._setStyles(ctx, param, viewMatrix, strokeMatrix);
 			var style = this._style;
 			if (style.hasFill()) {
-				ctx.fill(style.getFillRule());
+				this._fill(ctx, strokeMatrix);
 				ctx.shadowColor = 'rgba(0,0,0,0)';
 			}
 			if (style.hasStroke())
@@ -12880,8 +12898,9 @@ var Color = Base.extend(new function() {
 						+ components.join(',') + ')';
 		},
 
-		toCanvasStyle: function(ctx, matrix) {
-			if (this._canvasStyle)
+		toCanvasStyle: function(ctx, matrix, screenMatrix) {
+			var screen = screenMatrix && this._type === 'gradient';
+			if (this._canvasStyle && !screen)
 				return this._canvasStyle;
 			if (this._type !== 'gradient')
 				return this._canvasStyle = this.toCSS();
@@ -12898,6 +12917,24 @@ var Color = Base.extend(new function() {
 				destination = inverse._transformPoint(destination);
 				if (highlight)
 					highlight = inverse._transformPoint(highlight);
+			}
+			if (screen) {
+				var span = destination.subtract(origin),
+					m = screenMatrix,
+					det = m._a * m._d - m._b * m._c;
+				origin = m._transformPoint(origin);
+				if (highlight)
+					highlight = m._transformPoint(highlight);
+				if (gradient._radial) {
+					destination = origin.add(span.getLength()
+							* Math.sqrt(Math.abs(det)), 0);
+				} else {
+					var normal = new Point(
+							(m._d * span.x - m._b * span.y) / det,
+							(m._a * span.y - m._c * span.x) / det);
+					destination = origin.add(normal.multiply(
+							span.dot(span) / normal.dot(normal)));
+				}
 			}
 			if (gradient._radial) {
 				var radius = destination.getDistance(origin);
@@ -12920,7 +12957,7 @@ var Color = Base.extend(new function() {
 						offset == null ? i / (l - 1) : offset,
 						stop._color.toCanvasStyle());
 			}
-			return this._canvasStyle = canvasGradient;
+			return screen ? canvasGradient : this._canvasStyle = canvasGradient;
 		},
 
 		transform: function(matrix) {
