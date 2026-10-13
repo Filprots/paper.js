@@ -866,12 +866,568 @@ var Raster = Item.extend(/** @lends Raster# */{
                 disabled ? false : smoothing
             );
 
-            ctx.drawImage(element,
-                    -this._size.width / 2, -this._size.height / 2);
+            // IRRIS: a big picture on a view is drawn from its screen copies
+            // (see Raster.screenCopies). Only a view's draw uses them
+            // (param.updateMatrix: Project#draw()), never #rasterize() or an
+            // export, and never a raster drawn pixel for pixel (smoothing off).
+            var size = this._size,
+                copy = param.updateMatrix && !disabled
+                    && Raster._screenCopy(this, element, viewMatrix,
+                        param.pixelRatio);
+            if (copy && copy.width !== element.naturalWidth) {
+                // A halved copy, stretched over the picture's own size.
+                ctx.drawImage(copy, -size.width / 2, -size.height / 2,
+                        element.naturalWidth, element.naturalHeight);
+            } else {
+                ctx.drawImage(copy || element,
+                        -size.width / 2, -size.height / 2);
+            }
         }
     },
 
     _canComposite: function() {
         return true;
     }
+}, new function() { // IRRIS: injection scope for the screen copies
+
+    // Screen copies of a big picture (IRRIS, todo 2026-10-10_2/06). A view
+    // drew a big <img> (a photo or a plan under the design) at its full size
+    // at every redraw, and the browser keeps its decoded pixels only as long
+    // as its image cache allows: with little memory (a mid-range PC, Chrome's
+    // low-end mode) a 24 - 60 MP picture was decoded again on the main thread
+    // at many wheel steps, 0.2 to 2 s each, and zoomed out a plan aliased
+    // into dots. Now an <img> of `minPixels` or more is decoded once into a
+    // canvas the page holds (its full size), plus copies halved down to
+    // `minSide` px. A view draws the smallest copy that still has a pixel per
+    // device pixel, and the full size above half size (pixel for pixel what
+    // the <img> gives); the <img> itself until they are made, then it is
+    // drawn again. None of it holds the main thread long (Chrome 154,
+    // measured): the picture is decoded from its file, createImageBitmap(blob),
+    // on another thread (createImageBitmap(img) decodes on the main one: 0.5 s
+    // for 24 MP on a mid-range PC), copied into its canvas (a PNG a strip per
+    // task), and each copy halved from the one before it a strip per task
+    // (resizing in one go, createImageBitmap's resize options included, runs
+    // on the main thread: 0.15 - 0.45 s). Canvases, not bitmaps: with a
+    // graphics card a canvas lives on it, while a bitmap drawn there was sent
+    // to it again at every zoom past half size (20 - 70 ms for 24 - 60 MP).
+    // The copies are shared by every Raster of the <img> (each Layouts sheet
+    // has its own) and made again when its src changes, or when the graphics
+    // card lost them. One not drawn for `releaseMs` is closed, except the one
+    // drawn last while its raster is still shown, and made again when wanted.
+    // A failed build leaves the <img> drawn as before, told once through
+    // Raster.screenCopiesFailed(). Raster.screenCopies = null switches it off.
+    var entries = [], // an entry per <img> with copies, see getEntry()
+        timer = null, // the next sweep(), while copies are held
+        SLICE = 1 << 20, // base64 characters decoded a task (4 | SLICE)
+        STRIP = 500000, // pixels of a level drawn a task
+        vector = /^data:image\/(svg|gif)/i, // an SVG or GIF data URL
+        animated = /\.(svg|gif)([?#]|$)/i; // an SVG or GIF file
+
+    // The entry of an <img>: made, and its copies started, at its first draw;
+    // made again when its src has changed (the attribute: reading the src
+    // property can cost a copy of a data URL in some browsers).
+    function getEntry(element, width, height, config) {
+        var src = element.getAttribute('src') || '';
+        for (var i = 0, l = entries.length; i < l; i++) {
+            var entry = entries[i];
+            if (entry.element === element) {
+                if (entry.src === src)
+                    return entry;
+                drop(entry);
+                break;
+            }
+        }
+        // The full size, then halved while longer than minSide; ratio: the
+        // copy's pixels per pixel of the picture (the smaller of the two).
+        var levels = [{ width: width, height: height, ratio: 1 }],
+            minSide = Math.max(+config.minSide || 0, 1),
+            w = width,
+            h = height;
+        while (Math.max(w, h) > minSide) {
+            w = Math.max(1, Math.round(w / 2));
+            h = Math.max(1, Math.round(h / 2));
+            levels.push({ width: w, height: h,
+                    ratio: Math.min(w / width, h / height) });
+        }
+        entry = { element: element, src: src, levels: levels, views: [],
+                ready: false, making: false, failed: false, dropped: false,
+                shown: null, raster: null };
+        entries.push(entry);
+        if (vector.test(src.slice(0, 15)) || !/^data:/.test(src)
+                && animated.test(src)) {
+            // An SVG is drawn sharp at every size, a GIF may move: drawn as
+            // before (a failed entry, without a word).
+            entry.failed = true;
+        } else {
+            build(entry, 0);
+            schedule(+config.releaseMs || 0);
+        }
+        return entry;
+    }
+
+    // Makes the missing levels from level `from` on (from 0: the whole
+    // picture decoded first), each copy halved from the one before it; then
+    // the views that drew the <img> meanwhile (or a copy standing in) are
+    // drawn again. The first build, and a rebuild after sweep().
+    function build(entry, from) {
+        var levels = entry.levels,
+            chain;
+        entry.making = true;
+        try {
+            chain = levels[from].image
+                    ? Promise.resolve(levels[from].image)
+                    : decode(entry.src).then(function(file) {
+                        return copy(file.bitmap, levels[0], file.png);
+                    }).then(function(image) {
+                        return keep(entry, 0, image);
+                    });
+            for (var i = from + 1, l = levels.length; i < l; i++)
+                chain = chain.then(halveTo(entry, i));
+        } catch (e) {
+            entry.making = false;
+            return fail(entry, e);
+        }
+        chain.then(function() {
+            entry.making = false;
+            if (!entry.dropped && !entry.failed) {
+                entry.ready = true;
+                redraw(entry);
+            }
+        }, function(error) {
+            entry.making = false;
+            fail(entry, error);
+        });
+    }
+
+    function halveTo(entry, index) {
+        return function(source) {
+            var level = entry.levels[index];
+            if (entry.dropped || entry.failed)
+                throw new Error('no longer wanted');
+            // A copy still held stays as it is.
+            return level.image || halve(source, level).then(function(image) {
+                return keep(entry, index, image);
+            });
+        };
+    }
+
+    // The whole picture, decoded off the main thread from its file; png:
+    // whether the file is a PNG (see copy()).
+    function decode(src) {
+        return fileOf(src).then(function(blob) {
+            return self.createImageBitmap(blob).then(function(bitmap) {
+                return { bitmap: bitmap, png: blob.type === 'image/png' };
+            });
+        });
+    }
+
+    // The file of a src: a data URL's base64 decoded a slice per task (at
+    // once it held the main thread 0.1 s for 24 MP on a mid-range PC), any
+    // other URL fetched.
+    function fileOf(src) {
+        var match = /^data:([^,;]*)[^,]*?(;base64)?,/.exec(src);
+        if (!match || !match[2]) {
+            return fetch(src).then(function(response) {
+                return response.blob();
+            });
+        }
+        var at = match[0].length,
+            parts = [];
+        return new Promise(function(resolve, reject) {
+            function slice() {
+                try {
+                    var end = Math.min(src.length, at + SLICE),
+                        chars = atob(src.slice(at, end)),
+                        bytes = new Uint8Array(chars.length);
+                    for (var i = 0, l = chars.length; i < l; i++)
+                        bytes[i] = chars.charCodeAt(i);
+                    parts.push(bytes);
+                    at = end;
+                    if (at < src.length) {
+                        setTimeout(slice, 0);
+                    } else {
+                        resolve(new Blob(parts, { type: match[1] }));
+                    }
+                } catch (e) {
+                    reject(e);
+                }
+            }
+            setTimeout(slice, 0);
+        });
+    }
+
+    // A canvas of the level's size.
+    function canvasOf(level) {
+        var canvas = document.createElement('canvas');
+        canvas.width = level.width;
+        canvas.height = level.height;
+        return canvas;
+    }
+
+    // Fills canvas a strip of rows per task (draw(y, next) draws rows y to
+    // next, maybe asynchronously), so that the page keeps its frames. What a
+    // strip throws rejects the promise (from a timer it would be an uncaught
+    // error, a crash for the planner).
+    function strips(canvas, draw) {
+        var width = canvas.width,
+            height = canvas.height,
+            rows = Math.max(1, Math.floor(STRIP / width)),
+            y = 0;
+        return new Promise(function(resolve, reject) {
+            function strip() {
+                var next = Math.min(height, y + rows);
+                new Promise(function(drawn) {
+                    drawn(draw(y, next));
+                }).then(function() {
+                    y = next;
+                    if (y < height) {
+                        setTimeout(strip, 0);
+                    } else {
+                        resolve(canvas);
+                    }
+                }).then(null, reject);
+            }
+            strip();
+        });
+    }
+
+    // The decoded picture copied into its canvas pixel for pixel, then the
+    // bitmap closed. A PNG (PDF pages and crops come as PNGs, up to 67 MP) a
+    // strip per task, each strip cut out of the bitmap first: with a graphics
+    // card only that strip goes there at a time (a whole picture: 55 ms for
+    // 60 MP on a fast one). Any other file at once, as each strip drawn from
+    // the bitmap would send all of it, and Chrome cuts a strip of a photo
+    // turned by its EXIF orientation (5 - 8) out of the wrong place.
+    function copy(bitmap, level, cut) {
+        var canvas = canvasOf(level),
+            ctx = canvas.getContext('2d'),
+            width = level.width;
+        ctx.imageSmoothingEnabled = false;
+        if (bitmap.width !== width || bitmap.height !== level.height) {
+            release(bitmap);
+            return Promise.reject(new Error('a ' + bitmap.width + 'x'
+                    + bitmap.height + ' picture for ' + width + 'x'
+                    + level.height));
+        }
+        return (cut ? strips(canvas, function(y, next) {
+            return self.createImageBitmap(bitmap, 0, y, width, next - y)
+                    .then(function(part) {
+                ctx.drawImage(part, 0, y);
+                release(part);
+            });
+        }) : new Promise(function(resolve) {
+            ctx.drawImage(bitmap, 0, 0);
+            resolve(canvas);
+        })).then(function(canvas) {
+            release(bitmap);
+            return canvas;
+        }, function(error) {
+            release(bitmap);
+            release(canvas);
+            throw error;
+        });
+    }
+
+    // A copy of source at the level's size (clipped strips meet as one
+    // drawing would). At exactly half size 'low' smoothing takes the mean of
+    // each 2 x 2 pixels, as a browser's own mipmap does.
+    function halve(source, level) {
+        var canvas = canvasOf(level),
+            ctx = canvas.getContext('2d');
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'low';
+        return strips(canvas, function(y, next) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(0, y, canvas.width, next - y);
+            ctx.clip();
+            ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+            ctx.restore();
+        });
+    }
+
+    // A level made goes to its entry, if it still wants it and the size is
+    // the level's (a canvas of another size would be drawn wrong).
+    function keep(entry, index, image) {
+        var level = entry.levels[index];
+        if (entry.dropped || entry.failed) {
+            release(image);
+            throw new Error('no longer wanted');
+        }
+        if (image.width !== level.width || image.height !== level.height) {
+            release(image);
+            throw new Error('a ' + image.width + 'x' + image.height
+                    + ' copy for ' + level.width + 'x' + level.height);
+        }
+        release(level.image);
+        level.image = image;
+        level.used = Date.now();
+        return image;
+    }
+
+    // A level closed by sweep() and wanted again: made again from the nearest
+    // bigger level held, else from the picture's file.
+    function remake(entry, index) {
+        var levels = entry.levels,
+            from = index;
+        while (from > 0 && !levels[from].image)
+            from--;
+        build(entry, from);
+    }
+
+    // While a level is made: the nearest one held, a bigger one first.
+    function nearest(levels, index) {
+        for (var i = index - 1; i >= 0; i--) {
+            if (levels[i].image)
+                return levels[i];
+        }
+        for (var j = index + 1, l = levels.length; j < l; j++) {
+            if (levels[j].image)
+                return levels[j];
+        }
+        return null;
+    }
+
+    // The views that drew the <img> while its copies were made are drawn
+    // again, the way Project#_changed() asks for it.
+    function redraw(entry) {
+        var views = entry.views;
+        entry.views = [];
+        for (var i = 0, l = views.length; i < l; i++) {
+            var view = views[i];
+            if (view._project) {
+                view._needsUpdate = true;
+                if (!view._requested && view._autoUpdate)
+                    view.requestUpdate();
+            }
+        }
+    }
+
+    function release(image) {
+        if (image) {
+            if (image.close) {
+                image.close();
+            } else {
+                // A canvas.
+                image.width = image.height = 0;
+            }
+        }
+    }
+
+    // Whether the graphics card lost a level's canvas (its pixels are gone).
+    function lost(level) {
+        var ctx = level.image.getContext && level.image.getContext('2d');
+        return !!(ctx && ctx.isContextLost && ctx.isContextLost());
+    }
+
+    function closeAll(entry) {
+        var levels = entry.levels;
+        for (var i = 0, l = levels.length; i < l; i++) {
+            release(levels[i].image);
+            levels[i].image = null;
+        }
+    }
+
+    function drop(entry) {
+        entry.dropped = true;
+        closeAll(entry);
+        entry.views = [];
+        entry.shown = entry.raster = null;
+        var index = entries.indexOf(entry);
+        if (index !== -1)
+            entries.splice(index, 1);
+    }
+
+    // A failed build: the <img> is drawn as before and the failure told once
+    // (the entry stays, so that this src is not tried again).
+    function fail(entry, error) {
+        if (entry.dropped || entry.failed)
+            return;
+        entry.failed = true;
+        closeAll(entry);
+        redraw(entry);
+        var hook = Raster.screenCopiesFailed;
+        if (hook) {
+            try {
+                hook('Screen copies of a ' + entry.levels[0].width + 'x'
+                        + entry.levels[0].height + ' picture could not be'
+                        + ' made, it is drawn as before: '
+                        + (error && error.message || error));
+            } catch (e) {
+                // A failing hook changes nothing here.
+            }
+        }
+    }
+
+    // Whether a raster is still shown: inserted, visible up to its layer, and
+    // its view's canvas in the page.
+    function isShown(item) {
+        var view = item._project && item._project._view;
+        if (!view || !item.isInserted() || !view.isVisible())
+            return false;
+        for (; item; item = item._parent) {
+            if (!item._visible)
+                return false;
+        }
+        return true;
+    }
+
+    function schedule(delay) {
+        if (!timer)
+            timer = setTimeout(sweep, Math.max(delay, 0) + 50);
+    }
+
+    // Levels not drawn for releaseMs are closed, all of them once switched
+    // off; an entry left with none goes, to be made again at its next draw.
+    function sweep() {
+        timer = null;
+        var config = Raster.screenCopies,
+            releaseMs = config && +config.releaseMs || 0,
+            now = Date.now(),
+            next = Infinity;
+        for (var i = entries.length - 1; i >= 0; i--) {
+            var entry = entries[i];
+            if (!config) {
+                drop(entry);
+                continue;
+            }
+            if (entry.failed)
+                continue;
+            if (entry.making) {
+                next = Math.min(next, releaseMs);
+                continue;
+            }
+            var levels = entry.levels,
+                held = false;
+            try {
+                var kept = entry.shown && isShown(entry.raster)
+                        ? entry.shown : null;
+                for (var j = 0, l = levels.length; j < l; j++) {
+                    var level = levels[j],
+                        idle = now - level.used;
+                    if (!level.image)
+                        continue;
+                    if (level !== kept && idle >= releaseMs) {
+                        release(level.image);
+                        level.image = null;
+                    } else {
+                        held = true;
+                        next = Math.min(next, level === kept ? releaseMs
+                                : releaseMs - idle);
+                    }
+                }
+            } catch (e) {
+                // From a timer it would be an uncaught error: the entry goes
+                // (made again at its next draw) instead.
+                held = false;
+            }
+            if (!held)
+                drop(entry);
+        }
+        if (next < Infinity)
+            schedule(next);
+    }
+
+    return {
+        statics: {
+            /**
+             * IRRIS: the screen copies of big pictures (see above): made for
+             * an <img> of minPixels or more, halved down to minSide px, closed
+             * when not drawn for releaseMs. `null` switches them off.
+             *
+             * @private
+             */
+            screenCopies: { minPixels: 4e6, minSide: 1024, releaseMs: 30000 },
+
+            /**
+             * IRRIS: told once, with a message, when the screen copies of a
+             * picture could not be made (it is drawn as before). By default a
+             * soft failure of the planner (window.pseudoErrors).
+             *
+             * @private
+             */
+            screenCopiesFailed: function(message) {
+                var list = self.pseudoErrors;
+                if (list && typeof list.push === 'function')
+                    list.push(JSON.stringify({ message: message,
+                            time: Date.now() }));
+            },
+
+            // The entries, for the checks only.
+            _screenCopies: entries,
+
+            /**
+             * IRRIS: what a view draws for the <img> element of raster at the
+             * matrix (picture to view) and pixel ratio: a held canvas of the
+             * picture's full size or smaller, or null for the element.
+             *
+             * @private
+             */
+            _screenCopy: function(raster, element, matrix, pixelRatio) {
+                var config = Raster.screenCopies;
+                // Not a canvas, an <img> loaded, in a browser that can do it.
+                if (!config || !matrix || element.getContext
+                        || !element.complete || !self.createImageBitmap)
+                    return null;
+                var width = element.naturalWidth,
+                    height = element.naturalHeight,
+                    entry = null;
+                if (!(width * height >= config.minPixels))
+                    return null;
+                try {
+                    entry = getEntry(element, width, height, config);
+                    if (entry.failed)
+                        return null;
+                    // Device pixels per pixel of the picture: the longer axis
+                    // of its matrix on the view, at the view's pixel ratio.
+                    var scale = Math.max(
+                            Math.sqrt(matrix._a * matrix._a
+                                + matrix._b * matrix._b),
+                            Math.sqrt(matrix._c * matrix._c
+                                + matrix._d * matrix._d))
+                            * (pixelRatio || 1),
+                        levels = entry.levels,
+                        index = 0;
+                    // The smallest copy with a pixel per device pixel; the
+                    // full size above half size.
+                    if (scale <= 0.5) {
+                        while (index + 1 < levels.length
+                                && levels[index + 1].ratio >= scale)
+                            index++;
+                    }
+                    var level = levels[index],
+                        drawn = level.image ? level : null;
+                    if (drawn && lost(drawn)) {
+                        // Made again from the picture's file; the <img> until
+                        // then.
+                        drop(entry);
+                        entry = getEntry(element, width, height, config);
+                        levels = entry.levels;
+                        drawn = null;
+                    }
+                    if (!drawn) {
+                        if (entry.ready) {
+                            if (!entry.making)
+                                remake(entry, index);
+                            drawn = nearest(levels, index);
+                        }
+                        // Drawn again once the level is there.
+                        var view = raster._project && raster._project._view;
+                        if (view && entry.views.indexOf(view) === -1)
+                            entry.views.push(view);
+                        if (!drawn)
+                            return null;
+                    }
+                    drawn.used = Date.now();
+                    entry.shown = drawn;
+                    entry.raster = raster;
+                    return drawn.image;
+                } catch (e) {
+                    if (entry)
+                        fail(entry, e);
+                    return null;
+                }
+            }
+        }
+    };
 });
