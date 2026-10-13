@@ -1196,6 +1196,9 @@ var Raster = Item.extend(/** @lends Raster# */{
         for (var i = 0, l = views.length; i < l; i++) {
             var view = views[i];
             if (view._project) {
+                // IRRIS: and an interaction's cache (CanvasView#update())
+                if (view._cache)
+                    view._cache.stale = true;
                 view._needsUpdate = true;
                 if (!view._requested && view._autoUpdate)
                     view.requestUpdate();

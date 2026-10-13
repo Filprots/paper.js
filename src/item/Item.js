@@ -42,7 +42,51 @@ var Item = Base.extend(Emitter, /** @lends Item# */{
          * @private
          */
         INSERT: { insert: true },
-        NO_INSERT: { insert: false }
+        NO_INSERT: { insert: false },
+
+        /**
+         * IRRIS: viewport culling on screen draws (CanvasView#update(), never
+         * #rasterize() or an export): an item that lies wholly outside the
+         * area drawn, its bounds padded by `CULL_PX` CSS px, `CULL_UNITS`
+         * project units and its own stroke, shadow and text reach (see
+         * #_getCullReach()), is not drawn. `false` switches it off (and the
+         * dash culling of Path).
+         *
+         * @private
+         */
+        cull: true,
+        CULL_PX: 40,
+        CULL_UNITS: 60,
+
+        // IRRIS: bumped at every change of an item's matrix or of its place
+        // in the scene graph: a cached _globalMatrix of another version is
+        // computed again (see #getGlobalMatrix()). A culled item is not
+        // drawn, so its draw no longer refreshes it.
+        _matrixVersion: 0,
+
+        /**
+         * IRRIS: the area a screen draw covers, as Item#draw() culls against
+         * it: left, top, right, bottom in the canvas' CSS px (before matrix,
+         * the view's), the same area in project coordinates (x0 ... y1) and
+         * the view's scale (CSS px per project unit). Null for a matrix that
+         * cannot be inverted (nothing is culled then).
+         *
+         * @private
+         */
+        _getCullArea: function(matrix, left, top, right, bottom) {
+            var inverse = matrix.inverted();
+            if (!inverse)
+                return null;
+            var rect = inverse._transformBounds(
+                    new Rectangle(left, top, right - left, bottom - top));
+            return {
+                left: left, top: top, right: right, bottom: bottom,
+                x0: rect.x, y0: rect.y,
+                x1: rect.x + rect.width, y1: rect.y + rect.height,
+                zoom: Math.sqrt(Math.abs(matrix._a * matrix._d
+                        - matrix._b * matrix._c))
+            };
+        }
     },
 
     _class: 'Item',
@@ -221,6 +265,24 @@ new function() { // Injection scope for various item event handlers
         }
         if (flags & /*#=*/ChangeFlag.MATRIX) {
             this._globalMatrix = undefined;
+        }
+        if (flags & /*#=*/(ChangeFlag.MATRIX | ChangeFlag.CHILDREN)) {
+            // IRRIS: every cached global matrix is checked again, see
+            // getGlobalMatrix(). An item inserted elsewhere is told only when
+            // the project tracks changes (INSERTION); its new parent always
+            // (CHILDREN).
+            Item._matrixVersion++;
+        }
+        if (flags & /*#=*/ChangeFlag.APPEARANCE) {
+            // IRRIS: the cull reach of this item and of the parents that
+            // cached it (a parent caches it only together with all of its
+            // children's: the first parent without one ends the walk), see
+            // _getCullReach().
+            var item = this;
+            if (item._cullReach)
+                item._cullReach = null;
+            while ((item = item._parent) && item._cullReach)
+                item._cullReach = null;
         }
         if (cacheParent
                 && (flags & /*#=*/(ChangeFlag.GEOMETRY | ChangeFlag.STROKE))) {
@@ -1271,6 +1333,17 @@ new function() { // Injection scope for various item event handlers
      */
     getGlobalMatrix: function(_dontClone) {
         var matrix = this._globalMatrix;
+        // IRRIS: an item's matrix cached before any item's matrix or place in
+        // the scene graph changed is computed again. The check of the parents
+        // below misses a parent moved and cached again since (by a draw, or
+        // by another child): culled items are not drawn, and the draw used
+        // to refresh every item's cached matrix. Not an item without a parent
+        // (a layer, a removed item, a symbol definition's item: its draw
+        // caches the matrix of the placement drawn last, and the bounds of
+        // its non-scaling strokes, a SymbolItem's bounds, are taken with it)
+        if (matrix && this._parent
+                && this._globalMatrixVersion !== Item._matrixVersion)
+            matrix = null;
         if (matrix) {
             // If there's a cached global matrix for this item, check if all its
             // parents also have one. If it's missing in any of its parents, it
@@ -1297,6 +1370,7 @@ new function() { // Injection scope for various item event handlers
             var parent = this._parent;
             if (parent)
                 matrix.prepend(parent.getGlobalMatrix(true));
+            this._globalMatrixVersion = Item._matrixVersion;
         }
         return _dontClone ? matrix : matrix.clone();
     },
@@ -4390,6 +4464,139 @@ new function() { // Injection scope for hit-test functions shared with project
         }
     },
 
+    /**
+     * IRRIS: where this item lies against the area of a screen draw (cull,
+     * see Item._getCullArea()): 1 wholly outside it, 2 wholly inside it (its
+     * children need no test), 0 partly. Its bounds (as #bounds, without
+     * strokes: paper's own cache entry) in its parent's coordinates, widened
+     * by its reach there, through the parent's global matrix, padded by
+     * Item.CULL_UNITS and by Item.CULL_PX plus its reach in screen px.
+     */
+    _getCullState: function(cull, matrix) {
+        var reach = this._cullReach || this._getCullReach(),
+            cached = this._bounds,
+            entry = cached && cached['000'],
+            rect = entry ? entry.rect
+                : this._getCachedBounds(null, { cacheItem: this }).rect,
+            units = reach[0],
+            x0 = rect.x - units,
+            y0 = rect.y - units,
+            x1 = rect.x + rect.width + units,
+            y1 = rect.y + rect.height + units;
+        if (!matrix.isIdentity()) {
+            // The box of the transformed box, term by term.
+            var a = matrix._a, b = matrix._b, c = matrix._c, d = matrix._d,
+                ax0 = a * x0, ax1 = a * x1, cy0 = c * y0, cy1 = c * y1,
+                bx0 = b * x0, bx1 = b * x1, dy0 = d * y0, dy1 = d * y1;
+            x0 = Math.min(ax0, ax1) + Math.min(cy0, cy1) + matrix._tx;
+            x1 = Math.max(ax0, ax1) + Math.max(cy0, cy1) + matrix._tx;
+            y0 = Math.min(bx0, bx1) + Math.min(dy0, dy1) + matrix._ty;
+            y1 = Math.max(bx0, bx1) + Math.max(dy0, dy1) + matrix._ty;
+        }
+        var pad = Item.CULL_UNITS + (Item.CULL_PX + reach[1]) / cull.zoom;
+        return x0 - pad > cull.x1 || y0 - pad > cull.y1
+                || x1 + pad < cull.x0 || y1 + pad < cull.y0 ? 1
+                : x0 >= cull.x0 && y0 >= cull.y0 && x1 <= cull.x1
+                    && y1 <= cull.y1 ? 2 : 0;
+    },
+
+    /**
+     * IRRIS: how far beyond its bounds this item can paint, in its parent's
+     * coordinates: [units, screen px, cacheable]. A stroke: half its width,
+     * times the miter limit for miter joins (a square cap: times sqrt(2)),
+     * in screen px when it does not scale; a shadow: its blur and offset; a
+     * text: half its font size (glyphs past the measured box); a group: the
+     * most of its children's, visible or not. Cached until the item or one
+     * of its children changes (#_changed()), never for a SymbolItem (its
+     * definition can change without telling it) or a group holding one.
+     */
+    _getCullReach: function() {
+        var reach = this._cullReach;
+        if (reach)
+            return reach;
+        var units = 0,
+            px = 0,
+            cache = true,
+            children = this._children,
+            sub;
+        if (this instanceof SymbolItem) {
+            sub = this._definition._item._getCullReach();
+            units = sub[0];
+            px = sub[1];
+            cache = false;
+        } else if (children && !(this instanceof CompoundPath)) {
+            for (var i = 0, l = children.length; i < l; i++) {
+                sub = children[i]._getCullReach();
+                if (sub[0] > units)
+                    units = sub[0];
+                if (sub[1] > px)
+                    px = sub[1];
+                if (!sub[2])
+                    cache = false;
+            }
+        } else {
+            var style = this._style;
+            if (style.hasStroke()) {
+                var stroke = style.getStrokeWidth() / 2 * Math.max(
+                        style.getStrokeJoin() === 'miter'
+                            ? style.getMiterLimit() : 1,
+                        style.getStrokeCap() === 'square' ? Math.SQRT2 : 1,
+                        1);
+                if (this._canScaleStroke && !style.getStrokeScaling())
+                    px = stroke;
+                else
+                    units = stroke;
+            }
+            if (style.hasShadow()) {
+                var offset = style.getShadowOffset();
+                units += style.getShadowBlur() + Math.abs(offset.x)
+                        + Math.abs(offset.y);
+            }
+            if (this instanceof TextItem)
+                units += style.getFontSize() / 2;
+        }
+        var m = this._matrix;
+        if (units && !m.isIdentity())
+            units *= Math.max(Math.sqrt(m._a * m._a + m._b * m._b),
+                    Math.sqrt(m._c * m._c + m._d * m._d));
+        // A reach that cannot be told (NaN): never culled.
+        reach = [units >= 0 ? units : Infinity, px >= 0 ? px : Infinity, cache];
+        if (cache)
+            this._cullReach = reach;
+        return reach;
+    },
+
+    /**
+     * IRRIS: the global matrices a draw of this culled item would cache for
+     * the symbol definitions it places, in the same order, without drawing:
+     * a definition's item keeps the matrix of the placement drawn last (it
+     * has no parent to compute it from), and the bounds of its non-scaling
+     * strokes - a SymbolItem's own bounds - are taken with it. Only into
+     * children that place symbols (their reach is not cacheable).
+     */
+    _cacheSymbolMatrices: function(matrix) {
+        if (!this._visible || this._opacity === 0)
+            return;
+        var globalMatrix = matrix.appended(this._matrix);
+        if (!globalMatrix.isInvertible())
+            return;
+        this._globalMatrix = globalMatrix;
+        this._globalMatrixVersion = Item._matrixVersion;
+        if (this instanceof SymbolItem) {
+            this._definition._item._cacheSymbolMatrices(globalMatrix);
+        } else if (this._children) {
+            var children = this._children,
+                clipItem = this._getClipItem && this._getClipItem();
+            if (clipItem && !clipItem._getCullReach()[2])
+                clipItem._cacheSymbolMatrices(globalMatrix);
+            for (var i = 0, l = children.length; i < l; i++) {
+                var child = children[i];
+                if (child !== clipItem && !child._getCullReach()[2])
+                    child._cacheSymbolMatrices(globalMatrix);
+            }
+        }
+    },
+
     draw: function(ctx, param, parentStrokeMatrix) {
         // Each time the project gets drawn, it's _updateVersion is increased.
         // Keep the _updateVersion of drawn items in sync, so we have an easy
@@ -4403,7 +4610,26 @@ new function() { // Injection scope for hit-test functions shared with project
         var matrices = param.matrices,
             viewMatrix = param.viewMatrix,
             matrix = this._matrix,
-            globalMatrix = matrices[matrices.length - 1].appended(matrix);
+            cull = param.cull,
+            inside = false;
+        // IRRIS: viewport culling (screen draws only, see Project#draw()): an
+        // item wholly outside the area drawn is not drawn. It still counts as
+        // drawn for its selection (_updateVersion above). Never a layer, a
+        // clip item or anything drawn as a clip, never a compound path's
+        // child (one canvas path with its siblings). The children of an item
+        // wholly inside the area are not tested.
+        if (cull && !param.clip && !param.dontStart && !this._clipMask
+                && this._parent && !(this instanceof Layer)) {
+            var state = this._getCullState(cull, matrices[matrices.length - 1]);
+            if (state === 1) {
+                // What the draw caches of the symbol definitions placed in it.
+                if (!this._getCullReach()[2])
+                    this._cacheSymbolMatrices(matrices[matrices.length - 1]);
+                return;
+            }
+            inside = state === 2 && !!this._children;
+        }
+        var globalMatrix = matrices[matrices.length - 1].appended(matrix);
         // If this item is not invertible, do not draw it. It appears to be a
         // good idea generally to not draw in such circumstances, e.g. SVG
         // handles it the same way.
@@ -4421,6 +4647,7 @@ new function() { // Injection scope for hit-test functions shared with project
         matrices.push(globalMatrix);
         if (param.updateMatrix) {
             this._globalMatrix = globalMatrix;
+            this._globalMatrixVersion = Item._matrixVersion;
         }
 
         // If the item has a blendMode or is defining an opacity, draw it on
@@ -4512,7 +4739,14 @@ new function() { // Injection scope for hit-test functions shared with project
             if (offset)
                 ctx.translate(-offset.x, -offset.y);
         }
-        this._draw(ctx, param, viewMatrix, strokeMatrix);
+        if (inside) {
+            // IRRIS: wholly inside the area: its children are not tested
+            param.cull = null;
+            this._draw(ctx, param, viewMatrix, strokeMatrix);
+            param.cull = cull;
+        } else {
+            this._draw(ctx, param, viewMatrix, strokeMatrix);
+        }
         ctx.restore();
         matrices.pop();
         if (param.clip && !param.dontFinish) {

@@ -95,6 +95,19 @@ var Project = PaperScopeItem.extend(/** @lends Project# */{
                 view._needsUpdate = true;
                 if (!view._requested && view._autoUpdate)
                     view.requestUpdate();
+                // IRRIS: a change drawn into the view's interaction cache
+                // makes it stale, and the last frame no seed for one (see
+                // CanvasView#update())
+                var cache = view._cache,
+                    seed = view._seed;
+                if (!(flags & /*#=*/ChangeFlag.VIEW)) {
+                    if (cache && !cache.stale
+                            && this._isCachedChange(flags, item, cache.top))
+                        cache.stale = true;
+                    if (seed && !seed.dirty
+                            && this._isCachedChange(flags, item, seed.top))
+                        seed.dirty = true;
+                }
             }
         }
         // Have project keep track of changed items so they can be iterated.
@@ -111,6 +124,26 @@ var Project = PaperScopeItem.extend(/** @lends Project# */{
                 changes.push(changesById[id] = { item: item, flags: flags });
             }
         }
+    },
+
+    /**
+     * IRRIS: whether a change of item can alter what the view's interaction
+     * cache holds, the layers below index top: an item in one of them, a
+     * layer moved, a symbol definition's item (placed anywhere), a change
+     * without an item. Not an item outside the scene graph, nor one in a
+     * live layer (top and above, drawn at every frame).
+     *
+     * @private
+     */
+    _isCachedChange: function(flags, item, top) {
+        if (!item)
+            return true;
+        if (item instanceof Layer) // removed: no _index
+            return !(item._index >= top)
+                    || !!(flags & /*#=*/ChangeFlag.INSERTION);
+        while (item._parent && !(item instanceof Layer))
+            item = item._parent;
+        return item instanceof Layer ? item._index < top : !!item._symbol;
     },
 
     /**
@@ -862,10 +895,23 @@ var Project = PaperScopeItem.extend(/** @lends Project# */{
         }
     },
 
-    draw: function(ctx, matrix, pixelRatio) {
+    draw: function(ctx, matrix, pixelRatio, _cull) {
         // Increase the _updateVersion before the draw-loop. After that, items
         // that are visible will have their _updateVersion set to the new value.
         this._updateVersion++;
+        this._drawLayers(ctx, matrix, pixelRatio, 0, this._children.length,
+                _cull);
+        this._drawSelection(ctx, matrix);
+    },
+
+    /**
+     * IRRIS: the layers from index `from` to `to` (exclusive), as #draw()
+     * draws them; `cull` the area drawn (Item._getCullArea(), screen draws
+     * only: CanvasView#update()) or null.
+     *
+     * @private
+     */
+    _drawLayers: function(ctx, matrix, pixelRatio, from, to, cull) {
         ctx.save();
         matrix.applyToContext(ctx);
         // Use new Base() so we can use param.extend() to easily override values
@@ -880,11 +926,20 @@ var Project = PaperScopeItem.extend(/** @lends Project# */{
                 // should not set this.
                 updateMatrix: true
             });
-        for (var i = 0, l = children.length; i < l; i++) {
+        if (cull && Item.cull)
+            param.cull = cull;
+        for (var i = from; i < to; i++) {
             children[i].draw(ctx, param);
         }
         ctx.restore();
+    },
 
+    /**
+     * IRRIS: the selection of the selected items, as #draw() ends.
+     *
+     * @private
+     */
+    _drawSelection: function(ctx, matrix) {
         // Draw the selection of the selected items in the project:
         if (this._selectionCount > 0) {
             ctx.save();

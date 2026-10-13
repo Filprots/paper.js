@@ -2224,6 +2224,122 @@ new function() { // Scope for drawing
         }
     }
 
+    // IRRIS: dash culling (screen draws only: param.cull, Item#draw()). The
+    // browser dashes a dashed path along its whole length, outside the view
+    // too: a planner's long control wires cost most of a frame at a close
+    // zoom. An open dashed path of straight segments, without a fill or a
+    // shadow, whose stroke does not scale and that spans 3 times the area
+    // drawn (across or down), is stroked only along its runs inside that
+    // area, padded by its stroke's reach; each run starts with
+    // lineDashOffset at its length so far, so its dashes fall where the
+    // whole path puts them (the browser measures in single precision, this
+    // in double: a dash's end can move by a fraction of a pixel). False for
+    // any other path: drawn as before.
+    function drawDashRuns(ctx, path, param, viewMatrix, strokeMatrix, style) {
+        var cull = param.cull,
+            segments = path._segments,
+            length = segments.length,
+            coords = new Array(6),
+            xs = new Array(length),
+            ys = new Array(length),
+            minX = Infinity,
+            minY = Infinity,
+            maxX = -Infinity,
+            maxY = -Infinity,
+            i, x, y;
+        if (length < 2 || style.hasShadow())
+            return false;
+        for (i = 0; i < length; i++) {
+            var segment = segments[i];
+            if (!segment._handleIn.isZero() || !segment._handleOut.isZero())
+                return false;
+            // The points as drawSegments() puts them.
+            segment._transformCoordinates(strokeMatrix, coords);
+            x = xs[i] = coords[0];
+            y = ys[i] = coords[1];
+            if (x < minX)
+                minX = x;
+            if (x > maxX)
+                maxX = x;
+            if (y < minY)
+                minY = y;
+            if (y > maxY)
+                maxY = y;
+        }
+        if (!(maxX - minX >= 3 * (cull.right - cull.left)
+                || maxY - minY >= 3 * (cull.bottom - cull.top)))
+            return false;
+        var reach = style.getStrokeWidth() / 2 * Math.max(
+                    style.getStrokeJoin() === 'miter'
+                        ? style.getMiterLimit() : 1,
+                    style.getStrokeCap() === 'square' ? Math.SQRT2 : 1, 1)
+                    + 2,
+            left = cull.left - reach,
+            top = cull.top - reach,
+            right = cull.right + reach,
+            bottom = cull.bottom + reach,
+            offset = style.getDashOffset() || 0,
+            done = 0,
+            open = false,
+            t0, t1;
+        if (!(reach < Infinity))
+            return false;
+        // Liang-Barsky: the part [t0, t1] of a segment inside the area.
+        function clip(p, q) {
+            if (p === 0)
+                return q >= 0;
+            var r = q / p;
+            if (p < 0) {
+                if (r > t1)
+                    return false;
+                if (r > t0)
+                    t0 = r;
+            } else {
+                if (r < t0)
+                    return false;
+                if (r < t1)
+                    t1 = r;
+            }
+            return true;
+        }
+        path._setStyles(ctx, param, viewMatrix);
+        for (i = 1; i < length; i++) {
+            var x0 = xs[i - 1],
+                y0 = ys[i - 1],
+                dx = xs[i] - x0,
+                dy = ys[i] - y0,
+                segmentLength = Math.sqrt(dx * dx + dy * dy);
+            t0 = 0;
+            t1 = 1;
+            if (clip(-dx, x0 - left) && clip(dx, right - x0)
+                    && clip(-dy, y0 - top) && clip(dy, bottom - y0)
+                    && t0 < t1) {
+                if (!open || t0 > 0) {
+                    if (open)
+                        ctx.stroke();
+                    ctx.beginPath();
+                    ctx.lineDashOffset = offset + done + t0 * segmentLength;
+                    ctx.moveTo(t0 > 0 ? x0 + t0 * dx : x0,
+                            t0 > 0 ? y0 + t0 * dy : y0);
+                    open = true;
+                }
+                ctx.lineTo(t1 < 1 ? x0 + t1 * dx : xs[i],
+                        t1 < 1 ? y0 + t1 * dy : ys[i]);
+                if (t1 < 1) {
+                    ctx.stroke();
+                    open = false;
+                }
+            } else if (open) {
+                ctx.stroke();
+                open = false;
+            }
+            done += segmentLength;
+        }
+        if (open)
+            ctx.stroke();
+        return true;
+    }
+
     function drawSegments(ctx, path, matrix) {
         var segments = path._segments,
             length = segments.length,
@@ -2297,6 +2413,14 @@ new function() { // Scope for drawing
                 // dashLength is only set if we can't draw dashes natively
                 dashLength = !paper.support.nativeDash && hasStroke
                         && dashArray && dashArray.length;
+
+            // IRRIS: dash culling, see drawDashRuns()
+            if (param.cull && Path.dashCull && strokeMatrix && hasStroke
+                    && !hasFill && !dontStart && !dontPaint && !this._closed
+                    && !dashLength && dashArray && dashArray.length
+                    && drawDashRuns(ctx, this, param, viewMatrix,
+                        strokeMatrix, style))
+                return;
 
             if (!dontStart)
                 ctx.beginPath();
@@ -2693,6 +2817,14 @@ new function() { // PostScript-style drawing commands
 
 // Mess with indentation in order to get more line-space below:
 statics: {
+    /**
+     * IRRIS: the dash culling of screen draws (see drawDashRuns() above);
+     * `false` switches it off. Item.cull = false switches it off too.
+     *
+     * @private
+     */
+    dashCull: true,
+
     /**
      * Returns the bounding rectangle of the item excluding stroke width.
      *

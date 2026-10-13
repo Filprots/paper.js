@@ -77,6 +77,8 @@ var View = Base.extend(Emitter, /** @lends View# */{
                         that._resizeWhenShown = size.isNaN() || size.isZero();
                         if (!that._resizeWhenShown)
                             that.setViewSize(size);
+                        else
+                            that._dropCache(); // a hidden sheet's
                     }
                 });
             }
@@ -281,6 +283,68 @@ var View = Base.extend(Emitter, /** @lends View# */{
      */
     pause: function() {
         this._animate = false;
+    },
+
+    /**
+     * IRRIS: an interaction with the view begins: a pan (kind 'pan', the
+     * default) or a wheel zoom ('zoom'). Until every interaction begun has
+     * ended, a CanvasView draws its layers below #cacheLiveLayer from a
+     * cache: a pan is a copy of it, a wheel step a scaled copy (a zoom only);
+     * the layers from #cacheLiveLayer up and the selection are drawn at every
+     * frame, and a change drawn into the cache draws it again. Calling it
+     * again for a kind already begun changes nothing.
+     *
+     * @param {String} [kind='pan']
+     * @return {Boolean} {@true if the view draws the interaction's frames
+     *     itself from a cache: a canvas view with #cacheEnabled that updates
+     *     itself (#autoUpdate: not in Node.js)}
+     */
+    beginInteraction: function(kind) {
+        var interactions = this._interactions || (this._interactions = {});
+        interactions[kind || 'pan'] = true;
+        return !!(this.cacheEnabled && this._context && this._autoUpdate);
+    },
+
+    /**
+     * IRRIS: an interaction begun by #beginInteraction() ends. When none is
+     * left the cache goes and the next frame is drawn directly, as it is
+     * without interactions (if a frame came from the cache meanwhile).
+     *
+     * @param {String} [kind='pan']
+     * @return {Boolean} {@true if that kind of interaction was going on}
+     */
+    endInteraction: function(kind) {
+        var interactions = this._interactions;
+        kind = kind || 'pan';
+        if (!interactions || !interactions[kind])
+            return false;
+        delete interactions[kind];
+        var left = false;
+        for (var key in interactions)
+            left = true;
+        if (!left)
+            this._interactions = null;
+        if (this._cache || this._cacheDrawn) {
+            // The next frame: directly, or (another interaction still going
+            // on) from the cache, drawn again if the view was zoomed
+            if (!left) {
+                this._dropCache(true);
+                this._cacheDrawn = false;
+            }
+            this._needsUpdate = true;
+            if (!this._requested && this._autoUpdate)
+                this.requestUpdate();
+        }
+        return true;
+    },
+
+    /**
+     * IRRIS: drops the interaction cache, if any (see CanvasView).
+     *
+     * @private
+     */
+    _dropCache: function() {
+        this._cache = null;
     },
 
     _handleFrame: function() {
