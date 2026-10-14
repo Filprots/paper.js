@@ -9,7 +9,7 @@
  *
  * All rights reserved.
  *
- * Date: Tue Oct 13 16:24:34 2026 +0200
+ * Date: Wed Oct 14 19:47:02 2026 +0200
  *
  ***
  *
@@ -14531,6 +14531,13 @@ var CanvasView = View.extend({
 			scaled = false;
 		if (cache.b !== matrix._b || cache.c !== matrix._c) {
 			this._resetCache(project, top);
+		} else if (cache.a === matrix._a && cache.d === matrix._d
+				&& !this._interactions.pan && !this._interactions.zoom) {
+			if (cache.valid && !(cache.exact && cache.tx === matrix._tx
+					&& cache.ty === matrix._ty)) {
+				this._seed = null;
+				this._resetCache(project, top);
+			}
 		} else if (cache.a === matrix._a && cache.d === matrix._d) {
 			dx = Math.round((matrix._tx - cache.tx) * pixelRatio);
 			dy = Math.round((matrix._ty - cache.ty) * pixelRatio);
@@ -14695,6 +14702,7 @@ var CanvasView = View.extend({
 		} else {
 			project._updateVersion++;
 			cache.valid = null;
+			cache.exact = false;
 			this._setCacheMatrix(matrix);
 			cache.seeded = false;
 		}
@@ -14722,6 +14730,7 @@ var CanvasView = View.extend({
 		context.restore();
 		cache.valid = [cache.marginX, cache.marginY,
 				cache.marginX + element.width, cache.marginY + element.height];
+		cache.exact = true;
 	},
 
 	_fillCache: function(project, x0, y0, x1, y1) {
@@ -14771,6 +14780,7 @@ var CanvasView = View.extend({
 		context.restore();
 		cache.tx += dx / cache.pixelRatio;
 		cache.ty += dy / cache.pixelRatio;
+		cache.exact = false;
 		if (valid) {
 			var x0 = Math.max(0, valid[0] + dx),
 				y0 = Math.max(0, valid[1] + dy),
