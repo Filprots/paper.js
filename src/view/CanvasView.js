@@ -227,11 +227,14 @@ var CanvasView = View.extend(/** @lends CanvasView# */{
     // the cache is moved under it. A wheel step of a zoom interaction
     // scales it (smoothed: a short blur) while it holds what falls on the
     // view (nothing drawn yet: drawn at the step's zoom; zoomed out past
-    // it: that step drawn directly). A change of anything
-    // drawn into it (Project#_changed(), a picture's screen copies made:
-    // Raster) draws it again. The live layers and the selection are drawn
-    // at every frame over it. The interaction's end drops it and draws the
-    // frame directly, as a frame without interactions.
+    // it: that step drawn directly). With neither a pan nor a zoom going on
+    // (another kind: the planner's flow animation over a still view, todo
+    // 2026-10-13_6/09) it is used only as a direct frame drew it at the
+    // view's matrix (cache.exact): a frame has a direct frame's pixels. A
+    // change of anything drawn into it (Project#_changed(), a picture's
+    // screen copies made: Raster) draws it again. The live layers and the
+    // selection are drawn at every frame over it. The last interaction's end
+    // drops it and draws the frame directly, as a frame without interactions.
     _updateFromCache: function(project, ctx, size) {
         var matrix = this._matrix,
             pixelRatio = this._pixelRatio,
@@ -250,6 +253,18 @@ var CanvasView = View.extend(/** @lends CanvasView# */{
             scaled = false;
         if (cache.b !== matrix._b || cache.c !== matrix._c) {
             this._resetCache(project, top);
+        } else if (cache.a === matrix._a && cache.d === matrix._d
+                && !this._interactions.pan && !this._interactions.zoom) {
+            // No pan or zoom going on (an animation over a still view, the
+            // planner's 'flow'): the cache only as a direct frame drew it at
+            // the view's matrix, so the frame has a direct frame's pixels; a
+            // view moved meanwhile (a pan that ended, the arrow keys) draws
+            // it again (todo 2026-10-13_6/09). An empty one is drawn below.
+            if (cache.valid && !(cache.exact && cache.tx === matrix._tx
+                    && cache.ty === matrix._ty)) {
+                this._seed = null;
+                this._resetCache(project, top);
+            }
         } else if (cache.a === matrix._a && cache.d === matrix._d) {
             // A pan: the content moves by (dx, dy) device px.
             dx = Math.round((matrix._tx - cache.tx) * pixelRatio);
@@ -448,6 +463,7 @@ var CanvasView = View.extend(/** @lends CanvasView# */{
             // drawn.
             project._updateVersion++;
             cache.valid = null;
+            cache.exact = false;
             this._setCacheMatrix(matrix);
             cache.seeded = false;
         }
@@ -478,6 +494,9 @@ var CanvasView = View.extend(/** @lends CanvasView# */{
         context.restore();
         cache.valid = [cache.marginX, cache.marginY,
                 cache.marginX + element.width, cache.marginY + element.height];
+        // A direct frame's pixels: exact at the cache's matrix (moved: no
+        // longer, see _moveCache()).
+        cache.exact = true;
     },
 
     // IRRIS: the cache's rectangle (x0, y0) - (x1, y1), device px, made
@@ -532,6 +551,7 @@ var CanvasView = View.extend(/** @lends CanvasView# */{
         context.restore();
         cache.tx += dx / cache.pixelRatio;
         cache.ty += dy / cache.pixelRatio;
+        cache.exact = false;
         if (valid) {
             var x0 = Math.max(0, valid[0] + dx),
                 y0 = Math.max(0, valid[1] + dy),

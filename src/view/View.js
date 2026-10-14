@@ -287,12 +287,16 @@ var View = Base.extend(Emitter, /** @lends View# */{
 
     /**
      * IRRIS: an interaction with the view begins: a pan (kind 'pan', the
-     * default) or a wheel zoom ('zoom'). Until every interaction begun has
-     * ended, a CanvasView draws its layers below #cacheLiveLayer from a
-     * cache: a pan is a copy of it, a wheel step a scaled copy (a zoom only);
-     * the layers from #cacheLiveLayer up and the selection are drawn at every
-     * frame, and a change drawn into the cache draws it again. Calling it
-     * again for a kind already begun changes nothing.
+     * default), a wheel zoom ('zoom'), or any other kind for something that
+     * changes over a still view (the planner's flow animation: 'flow').
+     * Until every interaction begun has ended, a CanvasView draws its layers
+     * below #cacheLiveLayer from a cache: a pan is a copy of it, a wheel step
+     * a scaled copy (a zoom only); with no pan or zoom going on it is used
+     * only as drawn at the view's matrix (a direct frame's pixels: a view
+     * moved meanwhile draws it again); the layers from #cacheLiveLayer up and
+     * the selection are drawn at every frame, and a change drawn into the
+     * cache draws it again. Calling it again for a kind already begun changes
+     * nothing.
      *
      * @param {String} [kind='pan']
      * @return {Boolean} {@true if the view draws the interaction's frames
